@@ -75,28 +75,17 @@ impl ModelCatalog {
                 continue;
             }
 
-            // GitHub Copilot: check for persisted OAuth tokens
-            if provider.id == "github-copilot" || provider.id == "copilot" {
-                let openfang_dir = std::env::var("HOME")
-                    .or_else(|_| std::env::var("USERPROFILE"))
-                    .map(|h| std::path::PathBuf::from(h).join(".openfang"))
-                    .unwrap_or_else(|_| std::path::PathBuf::from(".openfang"));
-                provider.auth_status =
-                    if crate::drivers::copilot::copilot_auth_available(&openfang_dir) {
-                        AuthStatus::Configured
-                    } else {
-                        AuthStatus::Missing
-                    };
-                continue;
-            }
-
             if !provider.key_required {
                 provider.auth_status = AuthStatus::NotRequired;
                 continue;
             }
 
             // Primary: check the provider's declared env var
-            let has_key = std::env::var(&provider.api_key_env).is_ok();
+            let has_key = if provider.api_key_env.is_empty() {
+                false
+            } else {
+                std::env::var(&provider.api_key_env).is_ok()
+            };
 
             // Secondary: provider-specific fallback auth
             let has_fallback = match provider.id.as_str() {
@@ -104,6 +93,7 @@ impl ModelCatalog {
                 "codex" => {
                     std::env::var("OPENAI_API_KEY").is_ok() || read_codex_credential().is_some()
                 }
+                "openai-codex" => crate::codex_oauth::codex_oauth_available(),
                 // claude-code is handled above (before key_required check)
                 _ => false,
             };
@@ -387,8 +377,8 @@ impl ModelCatalog {
                 display_name: display,
                 provider: provider.to_string(),
                 tier: ModelTier::Local,
-                context_window: 131_072,
-                max_output_tokens: 16_384,
+                context_window: 32_768,
+                max_output_tokens: 4_096,
                 input_cost_per_m: 0.0,
                 output_cost_per_m: 0.0,
                 supports_tools: true,
@@ -911,6 +901,16 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
+        // ── OpenAI Codex (OAuth) ────────────────────────────────────
+        ProviderInfo {
+            id: "openai-codex".into(),
+            display_name: "OpenAI Codex (OAuth)".into(),
+            api_key_env: String::new(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            key_required: false,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
         // ── Claude Code CLI ─────────────────────────────────────────
         ProviderInfo {
             id: "claude-code".into(),
@@ -976,10 +976,27 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("command-r", "command-r-plus"),
         ("command", "command-a"),
         // GitHub Copilot aliases
-        ("copilot", "gpt-4o"),
-        ("copilot-4o", "gpt-4o"),
-        ("copilot-opus", "claude-opus-4.6"),
-        ("copilot-sonnet", "claude-sonnet-4.6"),
+        ("copilot", "copilot/gpt-4o"),
+        ("copilot-4o", "copilot/gpt-4o"),
+        ("copilot-4o-mini", "copilot/gpt-4o-mini"),
+        ("copilot-4", "copilot/gpt-4"),
+        ("copilot-gpt4o", "copilot/gpt-4o"),
+        ("copilot-gpt4", "copilot/gpt-4"),
+        ("copilot-gpt41", "copilot/gpt-4.1"),
+        ("copilot-gpt41-mini", "copilot/gpt-4.1-mini"),
+        ("copilot-gpt41-nano", "copilot/gpt-4.1-nano"),
+        ("copilot-o3-mini", "copilot/o3-mini"),
+        ("copilot-o3", "copilot/o3"),
+        ("copilot-o4-mini", "copilot/o4-mini"),
+        ("copilot-o1", "copilot/o1"),
+        ("copilot-o1-mini", "copilot/o1-mini"),
+        ("copilot-claude-sonnet", "copilot/claude-3.5-sonnet"),
+        ("copilot-claude-sonnet-4", "copilot/claude-sonnet-4"),
+        ("copilot-gemini-flash", "copilot/gemini-2.0-flash"),
+        ("copilot-gemini-pro", "copilot/gemini-2.5-pro"),
+        ("copilot-grok", "copilot/grok-3-mini"),
+        ("copilot-deepseek", "copilot/deepseek-r1"),
+        ("copilot-mistral", "copilot/mistral-large"),
         // Chinese model aliases
         ("qwen", "qwen-plus"),
         ("glm", "glm-5-20250605"),
@@ -2918,9 +2935,266 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // GitHub Copilot — models fetched dynamically at runtime.
-        // No static entries needed; see kernel.rs fetch_copilot_models().
+        // GitHub Copilot (19) — included with GitHub Copilot subscription
         // ══════════════════════════════════════════════════════════════
+        // ── OpenAI models via Copilot ────────────────────────────────
+        ModelCatalogEntry {
+            id: "copilot/gpt-4o".into(),
+            display_name: "GPT-4o (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-gpt4o".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/gpt-4o-mini".into(),
+            display_name: "GPT-4o Mini (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Fast,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-4o-mini".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/gpt-4.1".into(),
+            display_name: "GPT-4.1 (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-gpt41".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/gpt-4.1-mini".into(),
+            display_name: "GPT-4.1 Mini (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Smart,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-gpt41-mini".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/gpt-4.1-nano".into(),
+            display_name: "GPT-4.1 Nano (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Fast,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-gpt41-nano".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/gpt-4".into(),
+            display_name: "GPT-4 (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Frontier,
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["copilot-gpt4".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/o3-mini".into(),
+            display_name: "o3-mini (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Frontier,
+            context_window: 200_000,
+            max_output_tokens: 100_000,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["copilot-o3-mini".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/o3".into(),
+            display_name: "o3 (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Frontier,
+            context_window: 200_000,
+            max_output_tokens: 100_000,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-o3".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/o4-mini".into(),
+            display_name: "o4-mini (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Smart,
+            context_window: 200_000,
+            max_output_tokens: 100_000,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-o4-mini".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/o1".into(),
+            display_name: "o1 (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Frontier,
+            context_window: 200_000,
+            max_output_tokens: 100_000,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-o1".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/o1-mini".into(),
+            display_name: "o1-mini (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["copilot-o1-mini".into()],
+        },
+        // ── Anthropic models via Copilot ─────────────────────────────
+        ModelCatalogEntry {
+            id: "copilot/claude-3.5-sonnet".into(),
+            display_name: "Claude 3.5 Sonnet (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Smart,
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-claude-sonnet".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/claude-sonnet-4".into(),
+            display_name: "Claude Sonnet 4 (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Smart,
+            context_window: 200_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-claude-sonnet-4".into()],
+        },
+        // ── Google models via Copilot ────────────────────────────────
+        ModelCatalogEntry {
+            id: "copilot/gemini-2.0-flash".into(),
+            display_name: "Gemini 2.0 Flash (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Fast,
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-gemini-flash".into()],
+        },
+        ModelCatalogEntry {
+            id: "copilot/gemini-2.5-pro".into(),
+            display_name: "Gemini 2.5 Pro (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["copilot-gemini-pro".into()],
+        },
+        // ── xAI models via Copilot ───────────────────────────────────
+        ModelCatalogEntry {
+            id: "copilot/grok-3-mini".into(),
+            display_name: "Grok 3 Mini (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Fast,
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["copilot-grok".into()],
+        },
+        // ── DeepSeek models via Copilot ──────────────────────────────
+        ModelCatalogEntry {
+            id: "copilot/deepseek-r1".into(),
+            display_name: "DeepSeek R1 (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Frontier,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["copilot-deepseek".into()],
+        },
+        // ── Mistral models via Copilot ───────────────────────────────
+        ModelCatalogEntry {
+            id: "copilot/mistral-large".into(),
+            display_name: "Mistral Large (Copilot)".into(),
+            provider: "github-copilot".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["copilot-mistral".into()],
+        },
         // ══════════════════════════════════════════════════════════════
         // Qwen / Alibaba (6)
         // ══════════════════════════════════════════════════════════════
@@ -3892,7 +4166,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 41);
+        assert_eq!(catalog.list_providers().len(), 42);
     }
 
     #[test]
