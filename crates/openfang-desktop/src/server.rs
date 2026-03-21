@@ -60,9 +60,11 @@ impl Drop for ServerHandle {
 
 /// Boot the kernel and start the embedded API server on a background thread.
 ///
-/// Binds to `127.0.0.1:0` on the calling thread so the port is known before
-/// any Tauri window is created. The actual axum server runs on a dedicated
-/// thread with its own tokio runtime.
+/// Binds to `127.0.0.1:{OPENFANG_PORT}` when the env var is set, or
+/// `127.0.0.1:0` (random free port) otherwise.  Binding happens on the
+/// calling thread so the port is known before any Tauri window is created.
+/// The actual axum server runs on a dedicated thread with its own tokio
+/// runtime.
 pub fn start_server() -> Result<ServerHandle, Box<dyn std::error::Error>> {
     // Load .env and secrets.env into process environment (same as CLI).
     // Without this, API keys stored in ~/.openfang/.env are invisible to
@@ -74,8 +76,15 @@ pub fn start_server() -> Result<ServerHandle, Box<dyn std::error::Error>> {
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 
-    // Bind to a random free port on localhost (main thread — guarantees port)
-    let std_listener = TcpListener::bind("127.0.0.1:0")?;
+    // Bind to the port specified by OPENFANG_PORT env var, or a random free
+    // port when the variable is absent. This lets the host app (e.g. a Tauri
+    // sidecar launcher) pin the server to a known port.
+    let bind_port: u16 = std::env::var("OPENFANG_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let bind_addr = format!("127.0.0.1:{bind_port}");
+    let std_listener = TcpListener::bind(&bind_addr)?;
     let port = std_listener.local_addr()?.port();
     let listen_addr: SocketAddr = std_listener.local_addr()?;
 
