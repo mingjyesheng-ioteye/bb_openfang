@@ -1477,7 +1477,7 @@ pub async fn send_message_stream(
             tracing::warn!("Streaming message failed for agent {id}: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Streaming message failed"})),
+                Json(serde_json::json!({"error": format!("Streaming message failed: {e}")})),
             )
                 .into_response();
         }
