@@ -3622,6 +3622,104 @@ pub async fn install_skill(
     }
 }
 
+/// POST /api/skills/install-from-path — Install a skill from a local directory.
+///
+/// Copies the skill directory (which must contain a valid skill.toml) into
+/// `~/.openfang/skills/{name}/` and hot-reloads the skill registry.
+pub async fn install_skill_from_path(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SkillInstallFromPathRequest>,
+) -> impl IntoResponse {
+    let source = std::path::PathBuf::from(&req.path);
+    if !source.exists() || !source.is_dir() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Path does not exist or is not a directory: {}", req.path)})),
+        );
+    }
+
+    let manifest_path = source.join("skill.toml");
+    if !manifest_path.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No skill.toml found in the specified directory"})),
+        );
+    }
+
+    // Parse manifest to get skill name
+    let toml_str = match std::fs::read_to_string(&manifest_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to read skill.toml: {e}")})),
+            );
+        }
+    };
+
+    let manifest: openfang_skills::SkillManifest = match toml::from_str(&toml_str) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid skill.toml: {e}")})),
+            );
+        }
+    };
+
+    let skill_name = manifest.skill.name.clone();
+    let skill_version = manifest.skill.version.clone();
+    let tools_count = manifest.tools.provided.len();
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let dest = skills_dir.join(&skill_name);
+
+    // Create skills dir if needed
+    if let Err(e) = std::fs::create_dir_all(&skills_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to create skills directory: {e}")})),
+        );
+    }
+
+    // Copy directory recursively
+    fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let dest_path = dst.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_dir_recursive(&entry.path(), &dest_path)?;
+            } else {
+                std::fs::copy(&entry.path(), &dest_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    if let Err(e) = copy_dir_recursive(&source, &dest) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to copy skill: {e}")})),
+        );
+    }
+
+    // Hot-reload so agents see the new skill immediately
+    state.kernel.reload_skills();
+
+    tracing::info!("Installed skill from path: {skill_name} v{skill_version} ({tools_count} tools)");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "installed",
+            "name": skill_name,
+            "version": skill_version,
+            "tools_count": tools_count,
+            "source": req.path,
+        })),
+    )
+}
+
 /// POST /api/skills/uninstall — Uninstall a skill.
 pub async fn uninstall_skill(
     State(state): State<Arc<AppState>>,

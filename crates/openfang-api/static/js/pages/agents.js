@@ -136,6 +136,86 @@ function agentsPage() {
       return this.profileDescriptions[name] || { label: name, desc: '' };
     },
 
+    // ── Dynamic provider/model lists ──
+    spawnProviders: [],
+    spawnProvidersLoaded: false,
+    spawnModels: [],
+    spawnModelsLoading: false,
+    // ── Installed skills for selection ──
+    spawnSkills: [],
+    spawnSkillsLoaded: false,
+    spawnSelectedSkills: [],
+    // ── Agent templates ──
+    spawnTemplates: [],
+    spawnTemplatesLoading: false,
+    selectedTemplate: null,
+
+    async loadSpawnProviders() {
+      if (this.spawnProvidersLoaded) return;
+      try {
+        var data = await OpenFangAPI.get('/api/providers');
+        this.spawnProviders = (data.providers || []).sort(function(a, b) {
+          return (a.display_name || a.id).localeCompare(b.display_name || b.id);
+        });
+        this.spawnProvidersLoaded = true;
+      } catch(e) { this.spawnProviders = []; }
+    },
+
+    async loadModelsForProvider(provider) {
+      if (!provider) { this.spawnModels = []; return; }
+      this.spawnModelsLoading = true;
+      try {
+        var data = await OpenFangAPI.get('/api/models?provider=' + encodeURIComponent(provider));
+        this.spawnModels = (data.models || []).map(function(m) {
+          return { id: m.id, display_name: m.display_name || m.id, tier: m.tier || '' };
+        });
+        // If current model not in list, keep it (user may type custom)
+      } catch(e) { this.spawnModels = []; }
+      this.spawnModelsLoading = false;
+    },
+
+    async loadSpawnSkills() {
+      if (this.spawnSkillsLoaded) return;
+      try {
+        var data = await OpenFangAPI.get('/api/skills');
+        this.spawnSkills = (data.skills || []).filter(function(s) { return s.enabled !== false; });
+        this.spawnSkillsLoaded = true;
+      } catch(e) { this.spawnSkills = []; }
+    },
+
+    toggleSkill(skillName) {
+      var idx = this.spawnSelectedSkills.indexOf(skillName);
+      if (idx >= 0) {
+        this.spawnSelectedSkills.splice(idx, 1);
+      } else {
+        this.spawnSelectedSkills.push(skillName);
+      }
+    },
+
+    async loadTemplates() {
+      if (this.spawnTemplates.length > 0) return;
+      this.spawnTemplatesLoading = true;
+      try {
+        var data = await OpenFangAPI.get('/api/templates');
+        this.spawnTemplates = data.templates || [];
+      } catch(e) { this.spawnTemplates = []; }
+      this.spawnTemplatesLoading = false;
+    },
+
+    async spawnFromTemplate(name) {
+      this.selectedTemplate = name;
+      try {
+        var data = await OpenFangAPI.get('/api/templates/' + encodeURIComponent(name));
+        if (data.manifest_toml) {
+          this.spawnToml = data.manifest_toml;
+          this.spawnMode = 'toml';
+          OpenFangToast.success('Loaded template: ' + name);
+        }
+      } catch(e) {
+        OpenFangToast.error('Failed to load template: ' + e.message);
+      }
+    },
+
     // ── Tool Preview in Spawn Modal ──
     spawnProfiles: [],
     spawnProfilesLoaded: false,
@@ -408,7 +488,8 @@ function agentsPage() {
       this.spawnForm.model = 'default';
       this.spawnForm.systemPrompt = 'You are a helpful assistant.';
       this.spawnForm.profile = 'full';
-      // Fetch status defaults and dynamic provider list concurrently
+      this.spawnSelectedSkills = [];
+      this.selectedTemplate = null;
       this.spawnProvidersLoading = true;
       try {
         var results = await Promise.all([
@@ -420,10 +501,14 @@ function agentsPage() {
         if (status.default_provider) this.spawnForm.provider = status.default_provider;
         if (status.default_model) this.spawnForm.model = status.default_model;
         this.spawnProviders = provData.providers || [];
+        this.spawnProvidersLoaded = this.spawnProviders.length > 0;
       } catch(e) {
         this.spawnProviders = [];
+        this.spawnProvidersLoaded = false;
       }
       this.spawnProvidersLoading = false;
+      this.loadSpawnSkills();
+      this.loadModelsForProvider(this.spawnForm.provider);
     },
 
     nextStep() {
@@ -453,6 +538,10 @@ function agentsPage() {
       if (f.profile && f.profile !== 'custom') {
         lines.push('profile = "' + f.profile + '"');
       }
+      // Skills
+      if (this.spawnSelectedSkills.length > 0) {
+        lines.push('skills = [' + this.spawnSelectedSkills.map(function(s) { return '"' + tomlBasicEscape(s) + '"'; }).join(', ') + ']');
+      }
       lines.push('', '[model]');
       lines.push('provider = "' + f.provider + '"');
       lines.push('model = "' + f.model + '"');
@@ -464,6 +553,10 @@ function agentsPage() {
         if (f.caps.network) lines.push('network = ["*"]');
         if (f.caps.shell) lines.push('shell = ["*"]');
         if (f.caps.agent_spawn) lines.push('agent_spawn = true');
+      } else if (this.spawnSelectedSkills.length > 0) {
+        // When skills are selected, grant network access so skills can call APIs
+        lines.push('', '[capabilities]');
+        lines.push('network = ["*"]');
       }
       return lines.join('\n');
     },

@@ -373,6 +373,10 @@ pub async fn build_router(
             axum::routing::post(routes::install_skill),
         )
         .route(
+            "/api/skills/install-from-path",
+            axum::routing::post(routes::install_skill_from_path),
+        )
+        .route(
             "/api/skills/uninstall",
             axum::routing::post(routes::uninstall_skill),
         )

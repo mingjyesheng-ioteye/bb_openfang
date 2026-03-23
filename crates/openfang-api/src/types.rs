@@ -101,6 +101,13 @@ pub struct MigrateScanRequest {
     pub path: String,
 }
 
+/// Request to install a skill from a local directory path.
+#[derive(Debug, Deserialize)]
+pub struct SkillInstallFromPathRequest {
+    /// Absolute path to the skill directory (must contain skill.toml).
+    pub path: String,
+}
+
 /// Request to install a skill from ClawHub.
 #[derive(Debug, Deserialize)]
 pub struct ClawHubInstallRequest {

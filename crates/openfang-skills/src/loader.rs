@@ -109,6 +109,15 @@ async fn execute_python(
         if let Ok(tmp) = std::env::var("TEMP") {
             cmd.env("TEMP", tmp);
         }
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            cmd.env("USERPROFILE", up);
+        }
+        if let Ok(ad) = std::env::var("APPDATA") {
+            cmd.env("APPDATA", ad);
+        }
+        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+            cmd.env("LOCALAPPDATA", lad);
+        }
     }
     // Python needs PYTHONIOENCODING for UTF-8 output
     cmd.env("PYTHONIOENCODING", "utf-8");
@@ -125,6 +134,11 @@ async fn execute_python(
             .write_all(&payload_bytes)
             .await
             .map_err(|e| SkillError::ExecutionFailed(format!("Write stdin: {e}")))?;
+        // Flush before drop to ensure data is delivered
+        stdin
+            .flush()
+            .await
+            .map_err(|e| SkillError::ExecutionFailed(format!("Flush stdin: {e}")))?;
         drop(stdin);
     }
 
@@ -211,6 +225,15 @@ async fn execute_node(
         if let Ok(tmp) = std::env::var("TEMP") {
             cmd.env("TEMP", tmp);
         }
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            cmd.env("USERPROFILE", up);
+        }
+        if let Ok(ad) = std::env::var("APPDATA") {
+            cmd.env("APPDATA", ad);
+        }
+        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+            cmd.env("LOCALAPPDATA", lad);
+        }
     }
     // Node needs NODE_PATH sometimes
     cmd.env("NODE_NO_WARNINGS", "1");
@@ -256,18 +279,73 @@ async fn execute_node(
 }
 
 /// Find Python 3 binary.
+///
+/// On Windows, the Microsoft Store "python" / "python3" aliases can shadow real
+/// Python installs. These stubs live under `WindowsApps` and print an error
+/// instead of running Python. We detect and skip them.
 fn find_python() -> Option<String> {
-    for name in &["python3", "python"] {
-        if std::process::Command::new(name)
+    // Candidates: prefer python3 on Unix, python on Windows (where python3 is
+    // often the MS Store stub).
+    #[cfg(windows)]
+    let candidates = ["python", "python3"];
+    #[cfg(not(windows))]
+    let candidates = ["python3", "python"];
+
+    for name in &candidates {
+        let output = std::process::Command::new(name)
             .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(name.to_string());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let combined = format!("{stdout}{stderr}");
+                // Real Python prints "Python 3.x.y" — MS Store stub does not
+                if combined.contains("Python ") {
+                    return Some(name.to_string());
+                }
+            }
         }
     }
+
+    // Fallback: check common Windows install paths directly
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            // Standard installer: %LOCALAPPDATA%\Programs\Python\Python3XX\python.exe
+            let programs = std::path::Path::new(&local).join("Programs").join("Python");
+            if programs.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&programs) {
+                    // Sort descending to prefer newest Python version
+                    let mut dirs: Vec<_> = entries
+                        .flatten()
+                        .filter(|e| e.path().is_dir())
+                        .map(|e| e.path())
+                        .collect();
+                    dirs.sort();
+                    dirs.reverse();
+                    for dir in dirs {
+                        let py = dir.join("python.exe");
+                        if py.exists() {
+                            return Some(py.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // System-wide Python in C:\PythonXX or C:\Program Files\PythonXX
+        for prefix in &["C:\\Python3", "C:\\Program Files\\Python3"] {
+            for minor in (8..=15).rev() {
+                let path = format!("{prefix}{minor}\\python.exe");
+                if std::path::Path::new(&path).exists() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
     None
 }
 

@@ -1143,6 +1143,8 @@ function chatPage() {
           self.messages = [];
           OpenFangToast.success(t('chat.agent_stopped') + ' "' + name + '"');
           Alpine.store('app').refreshAgents();
+          // Return to agent list (close inline chat in agents page)
+          window.dispatchEvent(new CustomEvent('close-chat'));
         } catch(e) {
           OpenFangToast.error(t('chat.stop_agent_failed') + ': ' + e.message);
         }
