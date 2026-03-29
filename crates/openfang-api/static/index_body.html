@@ -5,57 +5,66 @@
   <div style="background:var(--bg-card,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:2rem;max-width:400px;width:90%">
     <!-- Session login mode -->
     <template x-if="$store.app.authMode === 'session'">
-                      <select class="form-select" x-model="spawnForm.provider" @change="loadModelsForProvider(spawnForm.provider)">
-                        <template x-if="spawnProvidersLoading">
-                          <option disabled>Loading providers…</option>
-                        </template>
-                        <template x-if="!spawnProvidersLoading && spawnProviders.filter(p => !p.is_local).length > 0">
-                          <optgroup label="Cloud">
-                            <template x-for="p in spawnProviders.filter(p => !p.is_local)" :key="p.id">
-                              <option :value="p.id" x-text="p.display_name + ((p.auth_status === 'configured' || p.auth_status === 'not_required') ? ' ✓' : '')"></option>
-                            </template>
-                          </optgroup>
-                        </template>
-                        <template x-if="!spawnProvidersLoading && spawnProviders.filter(p => p.is_local).length > 0">
-                          <optgroup label="Local">
-                            <template x-for="p in spawnProviders.filter(p => p.is_local)" :key="p.id">
-                              <option :value="p.id" x-text="p.display_name + ((p.auth_status === 'configured' || p.auth_status === 'not_required') ? ' ✓' : '')"></option>
-                            </template>
-                          </optgroup>
-                        </template>
-                        <template x-if="!spawnProvidersLoading && spawnProviders.length === 0">
-                          <optgroup label="Cloud">
-                            <option value="anthropic">Anthropic</option>
-                            <option value="openai">OpenAI</option>
-                            <option value="github-copilot">GitHub Copilot</option>
-                            <option value="gemini">Google Gemini</option>
-                            <option value="groq">Groq</option>
-                            <option value="deepseek">DeepSeek</option>
-                            <option value="openrouter">OpenRouter</option>
-                            <option value="mistral">Mistral</option>
-                            <option value="xai">xAI</option>
-                            <option value="together">Together</option>
-                            <option value="fireworks">Fireworks</option>
-                            <option value="cerebras">Cerebras</option>
-                            <option value="sambanova">SambaNova</option>
-                            <option value="azure">Azure OpenAI</option>
-                            <option value="nvidia">NVIDIA NIM</option>
-                            <option value="bedrock">AWS Bedrock</option>
-                            <option value="huggingface">Hugging Face</option>
-                            <option value="replicate">Replicate</option>
-                            <option value="chutes">Chutes.ai</option>
-                            <option value="venice">Venice.ai</option>
-                          </optgroup>
-                          <optgroup label="Local">
-                            <option value="ollama">Ollama</option>
-                            <option value="lmstudio">LM Studio</option>
-                            <option value="vllm">vLLM</option>
-                            <option value="lemonade">Lemonade</option>
-                            <option value="claude-code">Claude Code</option>
-                            <option value="qwen-code">Qwen Code</option>
-                          </optgroup>
-                        </template>
-                      </select>
+      <div>
+        <h3 style="margin:0 0 0.5rem;font-size:1.1rem">Sign In</h3>
+        <p style="color:var(--text-dim,#888);font-size:0.85rem;margin:0 0 1rem">Enter your dashboard credentials.</p>
+        <input type="text" x-model="loginUser" placeholder="Username" autocomplete="username" style="width:100%;padding:0.6rem;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg-input,#151520);color:var(--text,#e0e0e0);font-size:0.9rem;box-sizing:border-box;margin-bottom:0.5rem">
+        <input type="password" x-model="loginPass" placeholder="Password" autocomplete="current-password" @keydown.enter="$store.app.sessionLogin(loginUser, loginPass)" style="width:100%;padding:0.6rem;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg-input,#151520);color:var(--text,#e0e0e0);font-size:0.9rem;box-sizing:border-box;margin-bottom:0.75rem">
+        <button @click="$store.app.sessionLogin(loginUser, loginPass)" style="width:100%;padding:0.6rem;border-radius:6px;border:none;background:var(--accent,#7c3aed);color:#fff;font-weight:600;cursor:pointer;font-size:0.9rem">Sign In</button>
+      </div>
+    </template>
+    <!-- API key mode -->
+    <template x-if="$store.app.authMode === 'apikey'">
+      <div>
+        <h3 style="margin:0 0 0.5rem;font-size:1.1rem">API Key Required</h3>
+        <p style="color:var(--text-dim,#888);font-size:0.85rem;margin:0 0 0.5rem">This instance requires an API key. Enter the key from your <code>config.toml</code>.</p>
+        <p style="color:var(--text-dim,#666);font-size:0.75rem;margin:0 0 1rem">Add <code style="color:var(--accent-light,#a78bfa);background:var(--bg,#111);padding:1px 4px;border-radius:2px">api_key = "your-key"</code> at the <strong>top</strong> of <code>~/.openfang/config.toml</code> (not under any [section]).</p>
+        <input type="password" x-model="apiKeyInput" placeholder="Enter API key..." @keydown.enter="$store.app.submitApiKey(apiKeyInput)" style="width:100%;padding:0.6rem;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg-input,#151520);color:var(--text,#e0e0e0);font-size:0.9rem;box-sizing:border-box;margin-bottom:0.75rem">
+        <button @click="$store.app.submitApiKey(apiKeyInput)" style="width:100%;padding:0.6rem;border-radius:6px;border:none;background:var(--accent,#7c3aed);color:#fff;font-weight:600;cursor:pointer;font-size:0.9rem">Unlock Dashboard</button>
+      </div>
+    </template>
+  </div>
+</div>
+
+<div class="app-layout" :class="{ 'focus-mode': $store.app.focusMode }">
+  <!-- Sidebar -->
+  <nav class="sidebar" :class="{ collapsed: sidebarCollapsed, 'mobile-open': mobileMenuOpen }">
+    <div class="sidebar-header">
+      <div class="sidebar-header-text">
+        <div class="sidebar-logo">
+          <img src="/logo.png" alt="OpenFang" width="28" height="28">
+          <div>
+            <h1>OPENFANG</h1>
+            <div class="version" x-text="'v' + version"></div>
+          </div>
+        </div>
+      </div>
+      <div class="theme-switcher">
+        <button class="theme-opt" :class="{ active: themeMode === 'light' }" @click="setTheme('light')" title="Light">&#9788;</button>
+        <button class="theme-opt" :class="{ active: themeMode === 'system' }" @click="setTheme('system')" title="System">&#9675;</button>
+        <button class="theme-opt" :class="{ active: themeMode === 'dark' }" @click="setTheme('dark')" title="Dark">&#9790;</button>
+      </div>
+    </div>
+
+    <div class="sidebar-status" :class="{ offline: !connected && !$store.app.booting }">
+      <span class="status-dot"></span>
+      <span class="sidebar-label" x-show="connected" x-text="agentCount + ' agent(s) running'"></span>
+      <span class="sidebar-label" x-show="$store.app.booting && !connected" class="conn-reconnecting">Connecting...</span>
+      <span class="sidebar-label" x-show="!connected && !$store.app.booting && $store.app.connectionState === 'reconnecting'" class="conn-reconnecting">Reconnecting...</span>
+      <span class="sidebar-label" x-show="!connected && !$store.app.booting && $store.app.connectionState !== 'reconnecting'" x-text="'disconnected' + ($store.app.lastError ? ' — ' + $store.app.lastError : '')">disconnected</span>
+      <span class="conn-badge sidebar-label" :class="wsConnected ? 'ws' : 'http'" x-text="wsConnected ? 'WS' : 'HTTP'" x-show="connected"></span>
+    </div>
+
+    <div class="sidebar-nav" role="navigation" aria-label="Main navigation">
+      <!-- Chat — primary action -->
+      <div class="nav-section" x-data="{ collapsed: false }" aria-label="Chat">
+        <div class="nav-section-title" @click="collapsed = !collapsed">
+          <span class="nav-label">Chat</span>
+          <span class="nav-section-chevron" :style="collapsed ? '' : 'transform:rotate(90deg)'">&rsaquo;</span>
+        </div>
+        <template x-if="!collapsed">
+          <div x-transition>
+            <a class="nav-item" :class="{ active: page === 'agents' }" @click="navigate('agents')" :aria-current="page === 'agents' ? 'page' : false">
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span>
               <span class="nav-label">Chat</span>
             </a>
@@ -1164,34 +1173,25 @@
                   <div x-show="spawnStep === 2">
                     <div class="form-group">
                       <label>Provider</label>
-<<<<<<< HEAD
-                      <select class="form-select" x-model="spawnForm.provider">
+                      <select class="form-select" x-model="spawnForm.provider" @change="loadModelsForProvider(spawnForm.provider)">
                         <template x-if="spawnProvidersLoading">
                           <option disabled>Loading providers…</option>
-                        </template>
-                        <template x-if="!spawnProvidersLoading && spawnProviders.length === 0">
-                          <option disabled>No providers available</option>
                         </template>
                         <template x-if="!spawnProvidersLoading && spawnProviders.filter(p => !p.is_local).length > 0">
                           <optgroup label="Cloud">
                             <template x-for="p in spawnProviders.filter(p => !p.is_local)" :key="p.id">
-                              <option :value="p.id" x-text="p.display_name"></option>
+                              <option :value="p.id" x-text="p.display_name + ((p.auth_status === 'configured' || p.auth_status === 'not_required') ? ' ✓' : '')"></option>
                             </template>
                           </optgroup>
                         </template>
                         <template x-if="!spawnProvidersLoading && spawnProviders.filter(p => p.is_local).length > 0">
                           <optgroup label="Local">
                             <template x-for="p in spawnProviders.filter(p => p.is_local)" :key="p.id">
-                              <option :value="p.id" x-text="p.display_name"></option>
+                              <option :value="p.id" x-text="p.display_name + ((p.auth_status === 'configured' || p.auth_status === 'not_required') ? ' ✓' : '')"></option>
                             </template>
-=======
-                      <select class="form-select" x-model="spawnForm.provider" @change="loadModelsForProvider(spawnForm.provider)">
-                        <template x-if="spawnProviders.length > 0">
-                          <template x-for="p in spawnProviders" :key="p.id">
-                            <option :value="p.id" x-text="p.display_name + (p.auth_status === 'configured' ? ' ✓' : p.auth_status === 'not_required' ? ' ✓' : '')"></option>
-                          </template>
+                          </optgroup>
                         </template>
-                        <template x-if="spawnProviders.length === 0">
+                        <template x-if="!spawnProvidersLoading && spawnProviders.length === 0">
                           <optgroup label="Cloud">
                             <option value="anthropic">Anthropic</option>
                             <option value="openai">OpenAI</option>
@@ -1221,7 +1221,6 @@
                             <option value="lemonade">Lemonade</option>
                             <option value="claude-code">Claude Code</option>
                             <option value="qwen-code">Qwen Code</option>
->>>>>>> 99ca025 (feat: skill execution fixes, agent wizard enhancements, Python discovery)
                           </optgroup>
                         </template>
                       </select>
