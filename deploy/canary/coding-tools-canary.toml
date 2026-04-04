@@ -1,0 +1,5 @@
+# Enabled rollout profile: keep coding search tools enabled.
+# Use this as the default profile after promotion.
+
+[exec_policy]
+enable_coding_tools = true

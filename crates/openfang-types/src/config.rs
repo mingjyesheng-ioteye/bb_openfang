@@ -876,10 +876,32 @@ pub struct ExecPolicy {
     /// produce no stdout/stderr output for this duration. Default: 30.
     #[serde(default = "default_no_output_timeout")]
     pub no_output_timeout_secs: u64,
+    /// Enforce read-before-write on file mutation tools by default.
+    ///
+    /// When true, `file_write` and `apply_patch` updates/deletes require the file
+    /// to have been read in the current process session before mutation.
+    /// Individual tool calls can still override this behavior with
+    /// `require_read_before_write` in the tool input.
+    #[serde(default = "default_require_read_before_write")]
+    pub require_read_before_write: bool,
+    /// Feature flag for coding search tools (`file_search`, `grep_search`).
+    ///
+    /// When false, these tools are hidden from agent tool lists and blocked at
+    /// runtime if invoked directly.
+    #[serde(default = "default_enable_coding_tools")]
+    pub enable_coding_tools: bool,
 }
 
 fn default_no_output_timeout() -> u64 {
     30
+}
+
+fn default_require_read_before_write() -> bool {
+    true
+}
+
+fn default_enable_coding_tools() -> bool {
+    true
 }
 
 impl Default for ExecPolicy {
@@ -897,6 +919,8 @@ impl Default for ExecPolicy {
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
+            require_read_before_write: default_require_read_before_write(),
+            enable_coding_tools: default_enable_coding_tools(),
         }
     }
 }
@@ -3732,6 +3756,17 @@ mod tests {
         assert_eq!(config.log_level, "info");
         assert_eq!(config.api_listen, "127.0.0.1:50051");
         assert!(!config.network_enabled);
+        assert!(config.exec_policy.enable_coding_tools);
+    }
+
+    #[test]
+    fn test_exec_policy_disable_coding_tools_from_toml() {
+        let toml_str = r#"
+            [exec_policy]
+            enable_coding_tools = false
+        "#;
+        let config: KernelConfig = toml::from_str(toml_str).expect("parse kernel config");
+        assert!(!config.exec_policy.enable_coding_tools);
     }
 
     #[test]

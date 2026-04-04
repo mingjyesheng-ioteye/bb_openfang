@@ -14,6 +14,7 @@ use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
+use openfang_types::tool::is_coding_tool_name;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -5363,7 +5364,12 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 /// GET /api/tools — List all tool definitions (built-in + MCP).
 pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut tools: Vec<serde_json::Value> = builtin_tool_definitions()
+    let mut builtin = builtin_tool_definitions();
+    if !state.kernel.config.exec_policy.enable_coding_tools {
+        builtin.retain(|t| !is_coding_tool_name(&t.name));
+    }
+
+    let mut tools: Vec<serde_json::Value> = builtin
         .iter()
         .map(|t| {
             serde_json::json!({
@@ -6901,6 +6907,9 @@ pub async fn mcp_http(
 ) -> impl IntoResponse {
     // Gather all available tools (builtin + skills + MCP)
     let mut tools = builtin_tool_definitions();
+    if !state.kernel.config.exec_policy.enable_coding_tools {
+        tools.retain(|t| !is_coding_tool_name(&t.name));
+    }
     {
         let registry = state
             .kernel

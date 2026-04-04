@@ -276,6 +276,117 @@ openfang --version
 
 ---
 
+## 11. Coding Tools Rollout and Rollback Profiles
+
+Coding search tools (`file_search`, `grep_search`) are now default-enabled via `exec_policy.enable_coding_tools = true`.
+
+Use the shipped profiles for staged rollout or fast rollback:
+
+- Rollback profile (disabled): `deploy/canary/coding-tools-baseline.toml`
+- Enabled profile: `deploy/canary/coding-tools-canary.toml`
+
+Recommended sequence:
+
+1. Default-enable all nodes:
+
+```bash
+cp deploy/canary/coding-tools-canary.toml ~/.openfang/canary-profile.toml
+```
+
+2. Keep rollback profile ready for incident response:
+
+```bash
+cp deploy/canary/coding-tools-baseline.toml ~/.openfang/canary-profile.toml
+```
+
+3. Merge the profile into active config (or copy values into `~/.openfang/config.toml`):
+
+```toml
+[exec_policy]
+enable_coding_tools = true
+```
+
+4. Monitor canary metrics (latency/error rates) and expand gradually.
+
+Telemetry comparison helper:
+
+```powershell
+./scripts/collect-coding-rollout-metrics.ps1 \
+       -BaselineLog /path/to/baseline.log \
+       -CanaryLog /path/to/canary.log
+```
+
+Automated gate enforcement (non-zero exit on failure):
+
+```powershell
+./scripts/collect-coding-rollout-metrics.ps1 \
+       -BaselineLog /path/to/baseline.log \
+       -CanaryLog /path/to/canary.log \
+       -FailOnGateViolation
+```
+
+Single-window JSON evidence output:
+
+```powershell
+./scripts/collect-coding-rollout-metrics.ps1 \
+       -BaselineLog /path/to/baseline.log \
+       -CanaryLog /path/to/canary.log \
+       -OutputJson /path/to/window-report.json
+```
+
+Two-window promotion check (matches the checklist requirement):
+
+```powershell
+./scripts/evaluate-coding-promotion.ps1 \
+       -BaselineLogWindow1 /path/to/baseline-window1.log \
+       -CanaryLogWindow1 /path/to/canary-window1.log \
+       -BaselineLogWindow2 /path/to/baseline-window2.log \
+       -CanaryLogWindow2 /path/to/canary-window2.log
+```
+
+Two-window JSON evidence output:
+
+```powershell
+./scripts/evaluate-coding-promotion.ps1 \
+       -BaselineLogWindow1 /path/to/baseline-window1.log \
+       -CanaryLogWindow1 /path/to/canary-window1.log \
+       -BaselineLogWindow2 /path/to/baseline-window2.log \
+       -CanaryLogWindow2 /path/to/canary-window2.log \
+       -OutputJson /path/to/promotion-report.json
+```
+
+Generate markdown decision summary from two-window JSON:
+
+```powershell
+./scripts/render-coding-promotion-summary.ps1 \
+       -PromotionJson /path/to/promotion-report.json \
+       -OutputMarkdown /path/to/promotion-summary.md
+```
+
+The report compares:
+
+- Search timing medians/p95 (from `Search timing` logs)
+- Coding tool blocked count (`enable_coding_tools=false`)
+- Stale write rejection count (read-before-write guard)
+
+Promotion gate (canary -> default) for coding tools:
+
+- Canary search median must be <= baseline median (no regression)
+- Canary search p95 must not regress by more than 10%
+- Coding tool blocked count on canary nodes should be near zero after profile enablement
+- Stale write rejection count must not increase by more than 20% vs baseline
+
+If all gates pass for two consecutive observation windows, promote `enable_coding_tools = true` to default config.
+
+Suggested promotion sequence:
+
+1. Expand canary from 5% to 25% of nodes.
+2. Re-run telemetry comparison for a second window.
+3. Set default config to `enable_coding_tools = true` for new nodes.
+4. Keep feature flag available for quick rollback if error rate spikes.
+
+---
+
 ## Quick Reference — What Blocks What
 
 ```

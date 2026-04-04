@@ -1,0 +1,5 @@
+# Rollback profile: disable coding search tools.
+# Use this for fast fallback if canary/default rollout quality gates fail.
+
+[exec_policy]
+enable_coding_tools = false

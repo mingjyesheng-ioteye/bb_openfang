@@ -247,6 +247,9 @@ const TOOL_CALL_BEHAVIOR: &str = "\
 - Only explain tool calls when the action is destructive, unusual, or the user explicitly asked for an explanation.
 - Prefer action over narration. If you can answer by using a tool, do it.
 - When executing multiple sequential tool calls, batch them — don't output reasoning between each call.
+- For coding tasks, prefer `file_search`/`grep_search` to narrow targets before broad file reads.
+- Read before edit: call `file_read` before `file_write` or `apply_patch` on an existing file.
+- When there are no dependencies between read-only tool calls, execute them in parallel.
 - If a tool returns useful results, present the KEY information, not the raw output.
 - When web_fetch or web_search returns content, you MUST include the relevant data in your response. \
 Quote specific facts, numbers, or passages from the fetched content. Never say you fetched something \

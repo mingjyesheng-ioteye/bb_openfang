@@ -315,7 +315,7 @@ Auto-compaction is enabled by default when the session reaches the threshold (co
 **Fix**: Check the agent's manifest:
 ```toml
 [capabilities]
-tools = ["file_read", "web_fetch", "shell_exec"]  # Must list each tool
+tools = ["file_read", "file_search", "grep_search", "web_fetch", "shell_exec"]  # Must list each tool
 # OR
 # tools = ["*"]  # Grant all tools (use with caution)
 ```

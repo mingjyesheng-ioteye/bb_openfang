@@ -187,7 +187,7 @@ provider = "groq"
 model = "llama-3.3-70b-versatile"
 
 [capabilities]
-tools = ["file_read", "file_list", "web_fetch"]
+tools = ["file_read", "file_list", "file_search", "grep_search", "web_fetch"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 ```

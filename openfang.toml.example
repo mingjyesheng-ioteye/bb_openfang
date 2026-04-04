@@ -24,6 +24,12 @@ decay_rate = 0.05                         # Memory confidence decay rate
 listen_addr = "127.0.0.1:4200"           # OFP listen address
 # shared_secret = ""                      # Required for P2P authentication
 
+# Shell + file mutation safety defaults
+# [exec_policy]
+# mode = "allowlist"                      # deny | allowlist | full
+# require_read_before_write = true         # Default true: require file_read before file_write/apply_patch updates
+# enable_coding_tools = true               # Feature flag for file_search/grep_search
+
 # Session compaction (LLM-based context management)
 # [compaction]
 # threshold = 80                          # Compact when messages exceed this count

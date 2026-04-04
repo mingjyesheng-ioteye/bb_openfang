@@ -33,7 +33,7 @@ use openfang_types::config::{KernelConfig, OutputFormat};
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
-use openfang_types::tool::ToolDefinition;
+use openfang_types::tool::{is_coding_tool_name, ToolDefinition};
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -5516,6 +5516,15 @@ impl OpenFangKernel {
             builtin_tool_definitions()
                 .into_iter()
                 .filter(|t| !t.name.starts_with("browser_"))
+                .collect()
+        };
+
+        let all_builtins: Vec<ToolDefinition> = if self.config.exec_policy.enable_coding_tools {
+            all_builtins
+        } else {
+            all_builtins
+                .into_iter()
+                .filter(|t| !is_coding_tool_name(&t.name))
                 .collect()
         };
 

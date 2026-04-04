@@ -458,6 +458,57 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+### Coding Latency Benchmarks
+
+Run both manual benchmark harness tests (synthetic batch + real search scenario):
+
+```bash
+./scripts/benchmark-coding-latency.sh
+```
+
+```powershell
+./scripts/benchmark-coding-latency.ps1
+```
+
+Use `--no-capture` to suppress benchmark stdout timing lines.
+
+Aggregate multiple runs with median/p95 summary:
+
+```powershell
+./scripts/benchmark-coding-latency-summary.ps1 -Runs 5
+```
+
+### Coding Rollout Gate Checks
+
+Evaluate one canary window against baseline:
+
+```powershell
+./scripts/collect-coding-rollout-metrics.ps1 \
+  -BaselineLog C:\logs\baseline-window1.log \
+  -CanaryLog C:\logs\canary-window1.log \
+  -FailOnGateViolation \
+  -OutputJson C:\logs\window1-report.json
+```
+
+Enforce two-window promotion criteria:
+
+```powershell
+./scripts/evaluate-coding-promotion.ps1 \
+  -BaselineLogWindow1 C:\logs\baseline-window1.log \
+  -CanaryLogWindow1 C:\logs\canary-window1.log \
+  -BaselineLogWindow2 C:\logs\baseline-window2.log \
+  -CanaryLogWindow2 C:\logs\canary-window2.log \
+  -OutputJson C:\logs\promotion-report.json
+```
+
+Render a markdown decision summary:
+
+```powershell
+./scripts/render-coding-promotion-summary.ps1 \
+  -PromotionJson C:\logs\promotion-report.json \
+  -OutputMarkdown C:\logs\promotion-summary.md
+```
+
 ---
 
 ## Stability Notice

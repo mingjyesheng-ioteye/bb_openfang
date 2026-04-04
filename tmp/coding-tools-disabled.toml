@@ -1,0 +1,19 @@
+api_listen = "127.0.0.1:50052"
+
+[default_model]
+api_key_env = "GITHUB_TOKEN"
+model = "copilot/gpt-4o"
+provider = "github-copilot"
+
+[memory]
+decay_rate = 0.05
+
+[routing]
+complex_model = "copilot/gpt-4o"
+complex_threshold = 500
+medium_model = "copilot/gpt-4o"
+simple_model = "copilot/gpt-4o"
+simple_threshold = 100
+
+[exec_policy]
+enable_coding_tools = false

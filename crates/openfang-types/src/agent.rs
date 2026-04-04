@@ -203,20 +203,10 @@ impl AgentMode {
     pub fn filter_tools(&self, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
         match self {
             Self::Observe => vec![],
-            Self::Assist => {
-                let read_only = [
-                    "file_read",
-                    "file_list",
-                    "memory_recall",
-                    "web_fetch",
-                    "web_search",
-                    "agent_list",
-                ];
-                tools
-                    .into_iter()
-                    .filter(|t| read_only.contains(&t.name.as_str()))
-                    .collect()
-            }
+            Self::Assist => tools
+                .into_iter()
+                .filter(|t| crate::tool::is_read_only_tool_name(&t.name))
+                .collect(),
             Self::Full => tools,
         }
     }
@@ -913,6 +903,16 @@ mod tests {
                 input_schema: serde_json::Value::Null,
             },
             ToolDefinition {
+                name: "file_search".into(),
+                description: String::new(),
+                input_schema: serde_json::Value::Null,
+            },
+            ToolDefinition {
+                name: "grep_search".into(),
+                description: String::new(),
+                input_schema: serde_json::Value::Null,
+            },
+            ToolDefinition {
                 name: "file_write".into(),
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
@@ -934,9 +934,11 @@ mod tests {
             },
         ];
         let filtered = AgentMode::Assist.filter_tools(tools);
-        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered.len(), 5);
         let names: Vec<&str> = filtered.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"file_search"));
+        assert!(names.contains(&"grep_search"));
         assert!(names.contains(&"web_fetch"));
         assert!(names.contains(&"memory_recall"));
         assert!(!names.contains(&"file_write"));
