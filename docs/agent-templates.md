@@ -188,7 +188,7 @@ Writes clean, production-quality code with a step-by-step reasoning approach. Re
 - **Max tokens**: 8192
 - **Token quota**: 200,000/hour
 - **Max concurrent tools**: 10
-- **Tools**: `file_read`, `file_write`, `file_list`, `shell_exec`
+- **Tools**: `file_read`, `file_write`, `file_list`, `file_search`, `grep_search`, `code_symbol_refs`, `enter_plan_mode`, `exit_plan_mode`, `todo_write`, `shell_exec`
 - **Shell access**: `cargo *`, `rustc *`, `git *`, `npm *`, `python *`
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*"]`
 
@@ -844,7 +844,7 @@ max_concurrent_tools = 5            # Max parallel tool executions
 
 # Capability grants (principle of least privilege)
 [capabilities]
-tools = ["file_read", "file_write", "file_list", "shell_exec",
+tools = ["file_read", "file_write", "file_list", "file_search", "grep_search", "code_symbol_refs", "enter_plan_mode", "exit_plan_mode", "todo_write", "shell_exec",
          "memory_store", "memory_recall", "web_fetch",
          "agent_send", "agent_list", "agent_spawn", "agent_kill"]
 network = ["*"]                     # Network access patterns
@@ -862,6 +862,12 @@ shell = ["python *", "cargo *"]     # Allowed shell command patterns (whitelist)
 | `file_read` | Read file contents |
 | `file_write` | Write/create files |
 | `file_list` | List directory contents |
+| `file_search` | Find files by glob pattern (e.g. `**/*.rs`) |
+| `grep_search` | Search file contents with regex |
+| `code_symbol_refs` | Find likely symbol definitions and references across workspace files |
+| `enter_plan_mode` | Enable explicit planning mode for complex tasks |
+| `exit_plan_mode` | Exit planning mode (optionally approval-gated) |
+| `todo_write` | Manage agent-scoped persisted todo checklist |
 | `shell_exec` | Execute shell commands (restricted by `shell` whitelist) |
 | `memory_store` | Persist key-value data to memory |
 | `memory_recall` | Retrieve data from memory |

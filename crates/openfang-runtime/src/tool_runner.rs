@@ -6,17 +6,188 @@
 use crate::kernel_handle::KernelHandle;
 use crate::mcp;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
+use crate::command_lane::{classify_shell_command, shell_command_warning};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
-use openfang_types::tool::{ToolDefinition, ToolResult};
+use openfang_types::tool::{is_coding_tool_name, ToolDefinition, ToolResult};
 use openfang_types::tool_compat::normalize_tool_name;
-use std::collections::HashSet;
+use regex_lite::Regex;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tracing::{debug, warn};
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
+
+/// Default page size for search tools when limit is not explicitly provided.
+const DEFAULT_SEARCH_LIMIT: usize = 100;
+
+/// Global in-process read state for optional read-before-write enforcement.
+///
+/// Keyed by (agent_id, fully resolved file path). Value is the file
+/// modification time observed at read time.
+#[derive(Clone, Debug)]
+struct ReadSnapshot {
+    content_hash: String,
+}
+
+static READ_STATE: OnceLock<Mutex<HashMap<(String, PathBuf), ReadSnapshot>>> = OnceLock::new();
+
+fn read_state() -> &'static Mutex<HashMap<(String, PathBuf), ReadSnapshot>> {
+    READ_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remove all read-before-write tracking entries for a specific agent.
+///
+/// Called at agent loop teardown so read state does not leak across
+/// agent lifecycles or accumulate indefinitely.
+pub fn clear_read_state_for_agent(agent_id: &str) {
+    if let Ok(mut map) = read_state().lock() {
+        map.retain(|(entry_agent_id, _), _| entry_agent_id != agent_id);
+    }
+}
+
+fn read_state_key(path: &Path, caller_agent_id: Option<&str>) -> (String, PathBuf) {
+    (
+        caller_agent_id.unwrap_or("__default_agent__").to_string(),
+        path.to_path_buf(),
+    )
+}
+
+fn capture_read_snapshot(path: &Path) -> ReadSnapshot {
+    let content_hash = match std::fs::read(path) {
+        Ok(bytes) => {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            format!("{:x}", hasher.finalize())
+        }
+        Err(_) => String::new(),
+    };
+
+    ReadSnapshot { content_hash }
+}
+
+fn record_file_read(path: &Path, caller_agent_id: Option<&str>) {
+    let snapshot = capture_read_snapshot(path);
+    if let Ok(mut map) = read_state().lock() {
+        map.insert(read_state_key(path, caller_agent_id), snapshot);
+    }
+}
+
+fn should_enforce_read_before_write(
+    input: &serde_json::Value,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+) -> bool {
+    if let Some(explicit) = input["require_read_before_write"].as_bool() {
+        return explicit;
+    }
+
+    exec_policy
+        .map(|p| p.require_read_before_write)
+        .unwrap_or(true)
+}
+
+fn enforce_read_before_write(
+    input: &serde_json::Value,
+    path: &Path,
+    caller_agent_id: Option<&str>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+) -> Result<(), String> {
+    let required = should_enforce_read_before_write(input, exec_policy);
+    if !required {
+        return Ok(());
+    }
+
+    let recorded = {
+        let map = read_state()
+            .lock()
+            .map_err(|_| "read state lock poisoned".to_string())?;
+        map.get(&read_state_key(path, caller_agent_id)).cloned()
+    };
+
+    let Some(recorded_snapshot) = recorded else {
+        return Err(format!(
+            "Read-before-write precondition failed for '{}': file was not read in this session. Read the latest file contents first, then retry the write.",
+            path.display(),
+        ));
+    };
+
+    let current_snapshot = capture_read_snapshot(path);
+    if current_snapshot.content_hash != recorded_snapshot.content_hash {
+        return Err(format!(
+            "Read-before-write precondition failed for '{}': file changed after last read. Re-read the file to refresh state, then retry the write.",
+            path.display(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn glob_pattern_to_regex(pattern: &str) -> Result<Regex, String> {
+    let mut out = String::from("^");
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                // ** matches across path separators, * stays in a segment
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    out.push_str(".*");
+                    i += 1;
+                } else {
+                    out.push_str("[^/]*");
+                }
+            }
+            '?' => out.push('.'),
+            c if ".+()[]{}|^$\\".contains(c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out.push('$');
+    Regex::new(&out).map_err(|e| format!("Invalid glob pattern: {e}"))
+}
+
+async fn collect_files_recursive(base_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let mut stack = vec![base_dir.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|e| format!("Failed to read directory '{}': {e}", dir.display()))?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("Failed to read entry in '{}': {e}", dir.display()))?
+        {
+            let path = entry.path();
+            let meta = entry
+                .metadata()
+                .await
+                .map_err(|e| format!("Failed to stat '{}': {e}", path.display()))?;
+
+            if meta.is_dir() {
+                let name = entry.file_name();
+                if name == ".git" || name == "target" {
+                    continue;
+                }
+                stack.push(path);
+            } else if meta.is_file() {
+                files.push(path);
+            }
+        }
+    }
+
+    Ok(files)
+}
 
 /// Check if a tool name refers to a shell execution tool.
 ///
@@ -143,6 +314,25 @@ pub async fn execute_tool(
         }
     }
 
+    if is_coding_tool_name(tool_name)
+        && exec_policy
+            .map(|p| !p.enable_coding_tools)
+            .unwrap_or(false)
+    {
+        warn!(
+            tool = tool_name,
+            "Coding tool blocked by exec_policy.enable_coding_tools=false"
+        );
+        return ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: format!(
+                "Tool '{}' is disabled by exec_policy.enable_coding_tools=false",
+                tool_name
+            ),
+            is_error: true,
+        };
+    }
+
     // Approval gate: check if this tool requires human approval before execution.
     //
     // When exec_policy.mode = "full" (or allowlist with allowed_commands = ["*"]),
@@ -202,10 +392,19 @@ pub async fn execute_tool(
     debug!(tool_name, "Executing tool");
     let result = match tool_name {
         // Filesystem tools
-        "file_read" => tool_file_read(input, workspace_root).await,
-        "file_write" => tool_file_write(input, workspace_root).await,
+        "file_read" => tool_file_read(input, workspace_root, caller_agent_id).await,
+        "file_write" => {
+            tool_file_write(input, workspace_root, caller_agent_id, exec_policy).await
+        }
         "file_list" => tool_file_list(input, workspace_root).await,
-        "apply_patch" => tool_apply_patch(input, workspace_root).await,
+        "file_search" => tool_file_search(input, workspace_root).await,
+        "grep_search" => tool_grep_search(input, workspace_root).await,
+        "code_symbol_refs" => {
+            tool_code_symbol_refs(input, workspace_root, mcp_connections).await
+        }
+        "apply_patch" => {
+            tool_apply_patch(input, workspace_root, caller_agent_id, exec_policy).await
+        }
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => {
@@ -285,13 +484,24 @@ pub async fn execute_tool(
                     };
                 }
             }
-            tool_shell_exec(
+            let class = classify_shell_command(command);
+            let warning = shell_command_warning(command, class);
+            match tool_shell_exec(
                 input,
                 allowed_env_vars.unwrap_or(&[]),
                 workspace_root,
                 exec_policy,
             )
             .await
+            {
+                Ok(mut out) => {
+                    if let Some(msg) = warning {
+                        out = format!("Warning: {msg}\n\n{out}");
+                    }
+                    Ok(out)
+                }
+                Err(e) => Err(e),
+            }
         }
 
         // Inter-agent tools (require kernel handle)
@@ -303,6 +513,9 @@ pub async fn execute_tool(
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
+        "enter_plan_mode" => tool_enter_plan_mode(kernel, caller_agent_id),
+        "exit_plan_mode" => tool_exit_plan_mode(kernel, caller_agent_id),
+        "todo_write" => tool_todo_write(input, kernel, caller_agent_id),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -595,6 +808,53 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "file_search".to_string(),
+            description: "Find files by glob-style path pattern (e.g. '**/*.rs').".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Glob-style pattern to match relative file paths" },
+                    "path": { "type": "string", "description": "Base directory to search (defaults to current directory)" },
+                    "limit": { "type": "integer", "description": "Max number of matches to return (default: 100)" },
+                    "offset": { "type": "integer", "description": "Skip first N matches before returning results" }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: "grep_search".to_string(),
+            description: "Search file contents with regex. Supports content/files/count modes with limit and offset.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Regex pattern to search for" },
+                    "path": { "type": "string", "description": "Base directory or file path to search (defaults to current directory)" },
+                    "glob": { "type": "string", "description": "Optional file-path glob filter (e.g. '**/*.rs')" },
+                    "mode": { "type": "string", "description": "Output mode: 'content', 'files', or 'count' (default: 'files')" },
+                    "ignore_case": { "type": "boolean", "description": "Case-insensitive regex search" },
+                    "limit": { "type": "integer", "description": "Max number of output entries (default: 100)" },
+                    "offset": { "type": "integer", "description": "Skip first N entries before returning results" }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "code_symbol_refs".to_string(),
+            description: "Find likely symbol definitions and references across workspace files.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string", "description": "Exact symbol name to find" },
+                    "path": { "type": "string", "description": "Base directory or file path to search (defaults to current directory)" },
+                    "glob": { "type": "string", "description": "Optional file-path glob filter (e.g. '**/*.rs' or '**/*.{ts,tsx}')" },
+                    "mode": { "type": "string", "description": "Search mode: 'all', 'defs', or 'refs' (default: 'all')" },
+                    "limit": { "type": "integer", "description": "Max number of results to return (default: 100)" },
+                    "offset": { "type": "integer", "description": "Skip first N results before returning output" }
+                },
+                "required": ["symbol"]
+            }),
+        },
+        ToolDefinition {
             name: "apply_patch".to_string(),
             description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites.".to_string(),
             input_schema: serde_json::json!({
@@ -716,6 +976,34 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "key": { "type": "string", "description": "The storage key to recall" }
                 },
                 "required": ["key"]
+            }),
+        },
+        ToolDefinition {
+            name: "enter_plan_mode".to_string(),
+            description: "Enter plan mode for this agent. Use before implementation on complex tasks to keep work checklist-driven.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "exit_plan_mode".to_string(),
+            description: "Exit plan mode for this agent. This tool can be gated by approval policy via approval.require_approval = ['exit_plan_mode'].".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "todo_write".to_string(),
+            description: "Manage a session-persisted todo checklist for this agent while in plan mode.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "One of: add, set, remove, check, uncheck, clear, list" },
+                    "item": { "type": "string", "description": "Single todo text for add/remove/check/uncheck" },
+                    "items": { "type": "array", "description": "Todo text list for set action", "items": { "type": "string" } }
+                }
             }),
         },
         // --- Collaboration tools ---
@@ -1307,20 +1595,26 @@ fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<Pa
 async fn tool_file_read(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let resolved = resolve_file_path(raw_path, workspace_root)?;
-    tokio::fs::read_to_string(&resolved)
+    let content = tokio::fs::read_to_string(&resolved)
         .await
-        .map_err(|e| format!("Failed to read file: {e}"))
+        .map_err(|e| format!("Failed to read file: {e}"))?;
+    record_file_read(&resolved, caller_agent_id);
+    Ok(content)
 }
 
 async fn tool_file_write(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let resolved = resolve_file_path(raw_path, workspace_root)?;
+    enforce_read_before_write(input, &resolved, caller_agent_id, exec_policy)?;
     let content = input["content"]
         .as_str()
         .ok_or("Missing 'content' parameter")?;
@@ -1366,6 +1660,476 @@ async fn tool_file_list(
     Ok(files.join("\n"))
 }
 
+async fn tool_file_search(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let started = Instant::now();
+    let pattern = input["pattern"]
+        .as_str()
+        .ok_or("Missing 'pattern' parameter")?;
+    let base_raw = input["path"].as_str().unwrap_or(".");
+    let base_dir = resolve_file_path(base_raw, workspace_root)?;
+    let limit = input["limit"].as_u64().unwrap_or(DEFAULT_SEARCH_LIMIT as u64) as usize;
+    let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+
+    let matcher = glob_pattern_to_regex(pattern)?;
+    let files = collect_files_recursive(&base_dir).await?;
+
+    let mut matched = Vec::new();
+    for file in files {
+        if let Ok(rel) = file.strip_prefix(&base_dir) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if matcher.is_match(&rel_str) {
+                matched.push(rel_str);
+            }
+        }
+    }
+
+    matched.sort();
+    let total = matched.len();
+    let sliced: Vec<String> = matched.into_iter().skip(offset).take(limit).collect();
+    if sliced.is_empty() {
+        debug!(
+            tool = "file_search",
+            pattern,
+            total,
+            returned = 0,
+            limit,
+            offset,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Search timing"
+        );
+        return Ok("No files found".to_string());
+    }
+
+    let mut out = format!(
+        "Found {} files (showing {} from offset {}).\n",
+        total,
+        sliced.len(),
+        offset
+    );
+    out.push_str(&sliced.join("\n"));
+    debug!(
+        tool = "file_search",
+        pattern,
+        total,
+        returned = sliced.len(),
+        limit,
+        offset,
+        elapsed_ms = started.elapsed().as_millis(),
+        "Search timing"
+    );
+    Ok(out)
+}
+
+async fn tool_grep_search(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let started = Instant::now();
+    let query = input["query"].as_str().ok_or("Missing 'query' parameter")?;
+    let mode = input["mode"].as_str().unwrap_or("files");
+    let ignore_case = input["ignore_case"].as_bool().unwrap_or(false);
+    let limit = input["limit"].as_u64().unwrap_or(DEFAULT_SEARCH_LIMIT as u64) as usize;
+    let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+    let base_raw = input["path"].as_str().unwrap_or(".");
+    let base_path = resolve_file_path(base_raw, workspace_root)?;
+
+    let regex_pattern = if ignore_case {
+        format!("(?i){query}")
+    } else {
+        query.to_string()
+    };
+    let regex = Regex::new(&regex_pattern).map_err(|e| format!("Invalid regex pattern: {e}"))?;
+
+    let glob_matcher = if let Some(glob) = input["glob"].as_str() {
+        Some(glob_pattern_to_regex(glob)?)
+    } else {
+        None
+    };
+
+    let mut files = Vec::new();
+    if base_path.is_file() {
+        files.push(base_path.clone());
+    } else {
+        files = collect_files_recursive(&base_path).await?;
+    }
+
+    let mut entries = Vec::new();
+    for file in files {
+        let rel = if base_path.is_file() {
+            file.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file.to_string_lossy().to_string())
+        } else if let Ok(r) = file.strip_prefix(&base_path) {
+            r.to_string_lossy().replace('\\', "/")
+        } else {
+            file.to_string_lossy().replace('\\', "/")
+        };
+
+        if let Some(ref gm) = glob_matcher {
+            if !gm.is_match(&rel) {
+                continue;
+            }
+        }
+
+        let content = match tokio::fs::read_to_string(&file).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        match mode {
+            "count" => {
+                let count = regex.find_iter(&content).count();
+                if count > 0 {
+                    entries.push(format!("{rel}:{count}"));
+                }
+            }
+            "content" => {
+                for (idx, line) in content.lines().enumerate() {
+                    if regex.is_match(line) {
+                        entries.push(format!("{rel}:{}:{}", idx + 1, line));
+                    }
+                }
+            }
+            _ => {
+                if regex.is_match(&content) {
+                    entries.push(rel);
+                }
+            }
+        }
+    }
+
+    entries.sort();
+    let total = entries.len();
+    let paged: Vec<String> = entries.into_iter().skip(offset).take(limit).collect();
+    if paged.is_empty() {
+        debug!(
+            tool = "grep_search",
+            query,
+            mode,
+            total,
+            returned = 0,
+            limit,
+            offset,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Search timing"
+        );
+        return Ok("No matches found".to_string());
+    }
+    debug!(
+        tool = "grep_search",
+        query,
+        mode,
+        total,
+        returned = paged.len(),
+        limit,
+        offset,
+        elapsed_ms = started.elapsed().as_millis(),
+        "Search timing"
+    );
+    Ok(format!(
+        "Found {} matches (showing {} from offset {}).\n{}",
+        total,
+        paged.len(),
+        offset,
+        paged.join("\n")
+    ))
+}
+
+fn is_likely_definition_line(line: &str, symbol: &str) -> bool {
+    let patterns = [
+        format!(r"\bfn\s+{}\b", regex_lite::escape(symbol)),
+        format!(r"\bstruct\s+{}\b", regex_lite::escape(symbol)),
+        format!(r"\benum\s+{}\b", regex_lite::escape(symbol)),
+        format!(r"\btrait\s+{}\b", regex_lite::escape(symbol)),
+        format!(r"\bimpl\s+{}\b", regex_lite::escape(symbol)),
+        format!(r"\bdef\s+{}\b", regex_lite::escape(symbol)),
+        format!(r"\bclass\s+{}\b", regex_lite::escape(symbol)),
+        format!(r"\bfunction\s+{}\b", regex_lite::escape(symbol)),
+        format!(r"\b(const|let|var)\s+{}\b", regex_lite::escape(symbol)),
+    ];
+
+    patterns.iter().any(|p| {
+        Regex::new(p)
+            .map(|r| r.is_match(line))
+            .unwrap_or(false)
+    })
+}
+
+async fn tool_code_symbol_refs(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+) -> Result<String, String> {
+    let started = Instant::now();
+    let symbol = input["symbol"]
+        .as_str()
+        .ok_or("Missing 'symbol' parameter")?;
+    if symbol.trim().is_empty() {
+        return Err("'symbol' parameter must be non-empty".to_string());
+    }
+
+    let mode = input["mode"].as_str().unwrap_or("all");
+    if !matches!(mode, "all" | "defs" | "refs") {
+        return Err("Invalid mode. Expected one of: all, defs, refs".to_string());
+    }
+
+    let limit = input["limit"].as_u64().unwrap_or(DEFAULT_SEARCH_LIMIT as u64) as usize;
+    let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+    let base_raw = input["path"].as_str().unwrap_or(".");
+
+    // Wave 3 H5: prefer LSP-backed references/definitions via MCP tool providers
+    // (if available), then fall back to heuristic file scanning.
+    if let Some(content) =
+        try_code_symbol_refs_via_mcp(symbol, mode, base_raw, limit, offset, mcp_connections).await
+    {
+        debug!(
+            tool = "code_symbol_refs",
+            symbol,
+            mode,
+            source = "mcp-lsp",
+            elapsed_ms = started.elapsed().as_millis(),
+            "Search timing"
+        );
+        return Ok(content);
+    }
+
+    let base_path = resolve_file_path(base_raw, workspace_root)?;
+
+    let glob_matcher = if let Some(glob) = input["glob"].as_str() {
+        Some(glob_pattern_to_regex(glob)?)
+    } else {
+        None
+    };
+
+    let symbol_re = Regex::new(&format!(r"\b{}\b", regex_lite::escape(symbol)))
+        .map_err(|e| format!("Invalid symbol regex: {e}"))?;
+
+    let mut files = Vec::new();
+    if base_path.is_file() {
+        files.push(base_path.clone());
+    } else {
+        files = collect_files_recursive(&base_path).await?;
+    }
+
+    let mut entries = Vec::new();
+    for file in files {
+        let rel = if base_path.is_file() {
+            file.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file.to_string_lossy().to_string())
+        } else if let Ok(r) = file.strip_prefix(&base_path) {
+            r.to_string_lossy().replace('\\', "/")
+        } else {
+            file.to_string_lossy().replace('\\', "/")
+        };
+
+        if let Some(ref gm) = glob_matcher {
+            if !gm.is_match(&rel) {
+                continue;
+            }
+        }
+
+        let content = match tokio::fs::read_to_string(&file).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        for (idx, line) in content.lines().enumerate() {
+            if !symbol_re.is_match(line) {
+                continue;
+            }
+
+            let is_def = is_likely_definition_line(line, symbol);
+            if mode == "defs" && !is_def {
+                continue;
+            }
+            if mode == "refs" && is_def {
+                continue;
+            }
+
+            let kind = if is_def { "def" } else { "ref" };
+            entries.push(format!("{rel}:{}:{kind}:{}", idx + 1, line.trim()));
+        }
+    }
+
+    entries.sort();
+    let total = entries.len();
+    let paged: Vec<String> = entries.into_iter().skip(offset).take(limit).collect();
+    if paged.is_empty() {
+        debug!(
+            tool = "code_symbol_refs",
+            symbol,
+            mode,
+            total,
+            returned = 0,
+            limit,
+            offset,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Search timing"
+        );
+        return Ok("No symbol matches found".to_string());
+    }
+
+    debug!(
+        tool = "code_symbol_refs",
+        symbol,
+        mode,
+        total,
+        returned = paged.len(),
+        limit,
+        offset,
+        elapsed_ms = started.elapsed().as_millis(),
+        "Search timing"
+    );
+
+    Ok(format!(
+        "Found {} symbol matches (showing {} from offset {}).\n{}",
+        total,
+        paged.len(),
+        offset,
+        paged.join("\n")
+    ))
+}
+
+fn lsp_mcp_candidate_tools(tool_names: &[String], mode: &str) -> Vec<String> {
+    let mut defs = Vec::new();
+    let mut refs = Vec::new();
+    let mut hybrid = Vec::new();
+
+    for name in tool_names {
+        let lowered = name.to_ascii_lowercase();
+        let has_symbol = lowered.contains("symbol") || lowered.contains("workspace_symbol");
+        let has_def = lowered.contains("definition");
+        // Be conservative: plain "reference" is too broad and matches unrelated
+        // tools such as get_resource_reference. Prefer explicit refs/references naming.
+        let has_ref = lowered.contains("references")
+            || lowered.contains("_refs")
+            || lowered.contains("symbol_refs");
+
+        if !(has_symbol || has_def || has_ref) {
+            continue;
+        }
+
+        // Symbol-oriented tools are often generic wrappers that can provide
+        // both definitions and references depending on parameters.
+        if has_symbol {
+            hybrid.push(name.clone());
+            continue;
+        }
+
+        if has_def && has_ref {
+            hybrid.push(name.clone());
+        } else if has_def {
+            defs.push(name.clone());
+        } else if has_ref {
+            refs.push(name.clone());
+        } else if has_symbol {
+            hybrid.push(name.clone());
+        }
+    }
+
+    let mut out = Vec::new();
+    match mode {
+        "defs" => {
+            out.extend(defs);
+            out.extend(hybrid);
+        }
+        "refs" => {
+            out.extend(refs);
+            out.extend(hybrid);
+        }
+        _ => {
+            out.extend(hybrid);
+            out.extend(defs);
+            out.extend(refs);
+        }
+    }
+
+    // Deduplicate while preserving stable order.
+    let mut seen = HashSet::new();
+    out.into_iter().filter(|n| seen.insert(n.clone())).collect()
+}
+
+fn lsp_mcp_argument_variants(
+    symbol: &str,
+    path: &str,
+    mode: &str,
+    limit: usize,
+    offset: usize,
+) -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "symbol": symbol,
+            "path": path,
+            "mode": mode,
+            "limit": limit,
+            "offset": offset
+        }),
+        serde_json::json!({
+            "name": symbol,
+            "path": path,
+            "mode": mode,
+            "limit": limit,
+            "offset": offset
+        }),
+        serde_json::json!({
+            "query": symbol,
+            "path": path,
+            "mode": mode,
+            "limit": limit,
+            "offset": offset
+        }),
+        serde_json::json!({
+            "symbol_name": symbol,
+            "workspace": path
+        }),
+    ]
+}
+
+async fn try_code_symbol_refs_via_mcp(
+    symbol: &str,
+    mode: &str,
+    path: &str,
+    limit: usize,
+    offset: usize,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+) -> Option<String> {
+    let mcp_connections = mcp_connections?;
+    let args_variants = lsp_mcp_argument_variants(symbol, path, mode, limit, offset);
+
+    let mut conns = mcp_connections.lock().await;
+    for conn in conns.iter_mut() {
+        let tool_names: Vec<String> = conn.tools().iter().map(|t| t.name.clone()).collect();
+        let candidates = lsp_mcp_candidate_tools(&tool_names, mode);
+        if candidates.is_empty() {
+            continue;
+        }
+
+        for tool_name in candidates {
+            for args in &args_variants {
+                match conn.call_tool(&tool_name, args).await {
+                    Ok(content) => {
+                        let trimmed = content.trim();
+                        if trimmed.is_empty() || trimmed.starts_with("Error:") {
+                            continue;
+                        }
+                        return Some(format!(
+                            "LSP-backed symbol search via MCP tool '{}'.\n{}",
+                            tool_name, trimmed
+                        ));
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Patch tool
 // ---------------------------------------------------------------------------
@@ -1373,10 +2137,27 @@ async fn tool_file_list(
 async fn tool_apply_patch(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
 ) -> Result<String, String> {
     let patch_str = input["patch"].as_str().ok_or("Missing 'patch' parameter")?;
     let root = workspace_root.ok_or("apply_patch requires a workspace root")?;
     let ops = crate::apply_patch::parse_patch(patch_str)?;
+
+    // Optional read-before-write enforcement for patch updates/deletes.
+    if should_enforce_read_before_write(input, exec_policy) {
+        for op in &ops {
+            match op {
+                crate::apply_patch::PatchOp::UpdateFile { path, .. }
+                | crate::apply_patch::PatchOp::DeleteFile { path } => {
+                    let resolved = crate::workspace_sandbox::resolve_sandbox_path(path, root)?;
+                    enforce_read_before_write(input, &resolved, caller_agent_id, exec_policy)?;
+                }
+                crate::apply_patch::PatchOp::AddFile { .. } => {}
+            }
+        }
+    }
+
     let result = crate::apply_patch::apply_patch(&ops, root).await;
     if result.is_ok() {
         Ok(result.summary())
@@ -1721,6 +2502,155 @@ fn tool_memory_recall(
         Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
         None => Ok(format!("No value found for key '{key}'.")),
     }
+}
+
+fn require_caller_agent_id(caller_agent_id: Option<&str>) -> Result<&str, String> {
+    caller_agent_id
+        .filter(|s| !s.is_empty())
+        .ok_or("Missing caller agent context".to_string())
+}
+
+fn plan_mode_key(agent_id: &str) -> String {
+    format!("plan_mode::{agent_id}")
+}
+
+fn todo_key(agent_id: &str) -> String {
+    format!("todo::{agent_id}")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TodoItem {
+    text: String,
+    done: bool,
+}
+
+fn load_todos(kh: &Arc<dyn KernelHandle>, agent_id: &str) -> Result<Vec<TodoItem>, String> {
+    let key = todo_key(agent_id);
+    match kh.memory_recall(&key)? {
+        Some(v) => serde_json::from_value(v).map_err(|e| format!("Failed to parse todo list: {e}")),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn save_todos(kh: &Arc<dyn KernelHandle>, agent_id: &str, todos: &[TodoItem]) -> Result<(), String> {
+    let key = todo_key(agent_id);
+    let value = serde_json::to_value(todos).map_err(|e| format!("Failed to serialize todo list: {e}"))?;
+    kh.memory_store(&key, value)
+}
+
+fn format_todos(todos: &[TodoItem]) -> String {
+    if todos.is_empty() {
+        return "Todo list is empty.".to_string();
+    }
+    let lines: Vec<String> = todos
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let status = if t.done { "[x]" } else { "[ ]" };
+            format!("{}. {} {}", i + 1, status, t.text)
+        })
+        .collect();
+    format!("Todo list:\n{}", lines.join("\n"))
+}
+
+fn tool_enter_plan_mode(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = require_caller_agent_id(caller_agent_id)?;
+    kh.memory_store(&plan_mode_key(agent_id), serde_json::json!(true))?;
+    Ok("Plan mode enabled for this agent.".to_string())
+}
+
+fn tool_exit_plan_mode(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = require_caller_agent_id(caller_agent_id)?;
+    kh.memory_store(&plan_mode_key(agent_id), serde_json::json!(false))?;
+    Ok("Plan mode disabled for this agent.".to_string())
+}
+
+fn tool_todo_write(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = require_caller_agent_id(caller_agent_id)?;
+    let action = input["action"].as_str().unwrap_or("list");
+
+    let mut todos = load_todos(kh, agent_id)?;
+    match action {
+        "list" => {}
+        "clear" => {
+            todos.clear();
+        }
+        "add" => {
+            let item = input["item"].as_str().ok_or("Missing 'item' parameter for add")?;
+            let text = item.trim();
+            if text.is_empty() {
+                return Err("'item' must be non-empty".to_string());
+            }
+            todos.push(TodoItem {
+                text: text.to_string(),
+                done: false,
+            });
+        }
+        "set" => {
+            let items = input["items"].as_array().ok_or("Missing 'items' parameter for set")?;
+            todos = items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| TodoItem {
+                    text: s.trim().to_string(),
+                    done: false,
+                })
+                .filter(|t| !t.text.is_empty())
+                .collect();
+        }
+        "remove" | "check" | "uncheck" => {
+            let item = input["item"]
+                .as_str()
+                .ok_or(format!("Missing 'item' parameter for {action}"))?;
+            let idx = item
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1));
+            let pos = if let Some(i) = idx {
+                i
+            } else {
+                todos
+                    .iter()
+                    .position(|t| t.text.eq_ignore_ascii_case(item))
+                    .ok_or(format!("Todo item not found: {item}"))?
+            };
+
+            if pos >= todos.len() {
+                return Err(format!("Todo index out of range: {}", pos + 1));
+            }
+            match action {
+                "remove" => {
+                    todos.remove(pos);
+                }
+                "check" => {
+                    todos[pos].done = true;
+                }
+                "uncheck" => {
+                    todos[pos].done = false;
+                }
+                _ => {}
+            }
+        }
+        _ => {
+            return Err("Invalid action. Expected one of: add, set, remove, check, uncheck, clear, list".to_string());
+        }
+    }
+
+    save_todos(kh, agent_id, &todos)?;
+    Ok(format_todos(&todos))
 }
 
 // ---------------------------------------------------------------------------
@@ -3415,6 +4345,10 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         // Original 12
         assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"file_write"));
+        assert!(names.contains(&"file_list"));
+        assert!(names.contains(&"file_search"));
+        assert!(names.contains(&"grep_search"));
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"agent_send"));
         assert!(names.contains(&"agent_spawn"));
@@ -3608,6 +4542,915 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(result.content.contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn test_file_search_and_grep_search() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        std::fs::write(root.join("src").join("main.rs"), "fn main() { println!(\"hi\"); }")
+            .expect("write main.rs");
+        std::fs::write(root.join("README.md"), "hello openfang").expect("write readme");
+
+        let search = execute_tool(
+            "test-id",
+            "file_search",
+            &serde_json::json!({"path": ".", "pattern": "**/*.rs"}),
+            None,      // kernel
+            None,      // allowed_tools
+            None,      // caller_agent_id
+            None,      // skill_registry
+            None,      // mcp_connections
+            None,      // web_ctx
+            None,      // browser_ctx
+            None,      // allowed_env_vars
+            Some(root), // workspace_root
+            None,      // media_engine
+            None,      // exec_policy
+            None,      // tts_engine
+            None,      // docker_config
+            None,      // process_manager
+        )
+        .await;
+        assert!(!search.is_error, "file_search failed: {}", search.content);
+        assert!(search.content.contains("src/main.rs"));
+
+        let grep = execute_tool(
+            "test-id",
+            "grep_search",
+            &serde_json::json!({"path": ".", "query": "println!", "mode": "content"}),
+            None,      // kernel
+            None,      // allowed_tools
+            None,      // caller_agent_id
+            None,      // skill_registry
+            None,      // mcp_connections
+            None,      // web_ctx
+            None,      // browser_ctx
+            None,      // allowed_env_vars
+            Some(root), // workspace_root
+            None,      // media_engine
+            None,      // exec_policy
+            None,      // tts_engine
+            None,      // docker_config
+            None,      // process_manager
+        )
+        .await;
+        assert!(!grep.is_error, "grep_search failed: {}", grep.content);
+        assert!(grep.content.contains("src/main.rs:1:"));
+    }
+
+    #[tokio::test]
+    async fn test_code_symbol_refs() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "fn run_agent_loop() {}\nfn x(){ run_agent_loop(); }\n",
+        )
+        .expect("write rust file");
+
+        let defs = execute_tool(
+            "test-id",
+            "code_symbol_refs",
+            &serde_json::json!({"path": ".", "symbol": "run_agent_loop", "mode": "defs"}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!defs.is_error, "code_symbol_refs defs failed: {}", defs.content);
+        assert!(defs.content.contains(":def:"));
+
+        let refs = execute_tool(
+            "test-id",
+            "code_symbol_refs",
+            &serde_json::json!({"path": ".", "symbol": "run_agent_loop", "mode": "refs"}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!refs.is_error, "code_symbol_refs refs failed: {}", refs.content);
+        assert!(refs.content.contains(":ref:"));
+    }
+
+    struct FakeKernel {
+        memory: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kernel_handle::KernelHandle for FakeKernel {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
+            Vec::new()
+        }
+
+        fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
+            self.memory
+                .lock()
+                .map_err(|_| "memory lock poisoned".to_string())?
+                .insert(key.to_string(), value);
+            Ok(())
+        }
+
+        fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+            Ok(self
+                .memory
+                .lock()
+                .map_err(|_| "memory lock poisoned".to_string())?
+                .get(key)
+                .cloned())
+        }
+
+        fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
+            Vec::new()
+        }
+
+        async fn task_post(
+            &self,
+            _title: &str,
+            _description: &str,
+            _assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn task_claim(&self, _agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+
+        async fn task_complete(&self, _task_id: &str, _result: &str) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn task_list(&self, _status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn publish_event(
+            &self,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_add_entity(
+            &self,
+            _entity: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_add_relation(
+            &self,
+            _relation: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_query(
+            &self,
+            _pattern: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enter_and_exit_plan_mode() {
+        let kernel: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernel {
+            memory: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        let enter = execute_tool(
+            "test-id",
+            "enter_plan_mode",
+            &serde_json::json!({}),
+            Some(&kernel),
+            None,
+            Some("agent-x"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!enter.is_error, "enter_plan_mode failed: {}", enter.content);
+
+        let stored_on = kernel
+            .memory_recall("plan_mode::agent-x")
+            .expect("memory_recall")
+            .expect("key exists");
+        assert_eq!(stored_on, serde_json::json!(true));
+
+        let exit = execute_tool(
+            "test-id",
+            "exit_plan_mode",
+            &serde_json::json!({}),
+            Some(&kernel),
+            None,
+            Some("agent-x"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!exit.is_error, "exit_plan_mode failed: {}", exit.content);
+
+        let stored_off = kernel
+            .memory_recall("plan_mode::agent-x")
+            .expect("memory_recall")
+            .expect("key exists");
+        assert_eq!(stored_off, serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn test_todo_write_add_check_remove() {
+        let kernel: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernel {
+            memory: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        let add = execute_tool(
+            "test-id",
+            "todo_write",
+            &serde_json::json!({"action":"add","item":"Implement EPIC D"}),
+            Some(&kernel),
+            None,
+            Some("agent-todo"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!add.is_error, "todo add failed: {}", add.content);
+        assert!(add.content.contains("[ ] Implement EPIC D"));
+
+        let check = execute_tool(
+            "test-id",
+            "todo_write",
+            &serde_json::json!({"action":"check","item":"1"}),
+            Some(&kernel),
+            None,
+            Some("agent-todo"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!check.is_error, "todo check failed: {}", check.content);
+        assert!(check.content.contains("[x] Implement EPIC D"));
+
+        let remove = execute_tool(
+            "test-id",
+            "todo_write",
+            &serde_json::json!({"action":"remove","item":"1"}),
+            Some(&kernel),
+            None,
+            Some("agent-todo"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!remove.is_error, "todo remove failed: {}", remove.content);
+        assert!(remove.content.contains("Todo list is empty"));
+    }
+
+    #[test]
+    fn test_lsp_mcp_candidate_tools_defs_mode_prefers_definition_tools() {
+        let tools = vec![
+            "mcp_ls_find_references".to_string(),
+            "mcp_ls_find_definitions".to_string(),
+            "mcp_ls_symbol_refs".to_string(),
+            "mcp_ls_file_read".to_string(),
+        ];
+        let candidates = lsp_mcp_candidate_tools(&tools, "defs");
+        assert_eq!(candidates[0], "mcp_ls_find_definitions");
+        assert!(candidates.iter().any(|t| t == "mcp_ls_symbol_refs"));
+        assert!(!candidates.iter().any(|t| t == "mcp_ls_file_read"));
+    }
+
+    #[test]
+    fn test_lsp_mcp_candidate_tools_all_mode_includes_refs_and_defs() {
+        let tools = vec![
+            "mcp_a_find_references".to_string(),
+            "mcp_a_find_definitions".to_string(),
+            "mcp_a_symbol_refs".to_string(),
+        ];
+        let candidates = lsp_mcp_candidate_tools(&tools, "all");
+        assert_eq!(candidates[0], "mcp_a_symbol_refs");
+        assert!(candidates.iter().any(|t| t == "mcp_a_find_definitions"));
+        assert!(candidates.iter().any(|t| t == "mcp_a_find_references"));
+    }
+
+    #[test]
+    fn test_lsp_mcp_candidate_tools_ignores_non_lsp_reference_names() {
+        let tools = vec![
+            "mcp_misc_get_resource_reference".to_string(),
+            "mcp_misc_find_definitions".to_string(),
+        ];
+        let candidates = lsp_mcp_candidate_tools(&tools, "all");
+        assert!(!candidates
+            .iter()
+            .any(|t| t == "mcp_misc_get_resource_reference"));
+        assert!(candidates.iter().any(|t| t == "mcp_misc_find_definitions"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual benchmark harness"]
+    async fn benchmark_search_tools_parallel_vs_sequential() {
+        use futures::future::join_all;
+        use std::time::Instant;
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+
+        // Build a medium fixture tree for realistic grep/file_search workload.
+        for i in 0..120 {
+            let file = root.join("src").join(format!("mod_{i}.rs"));
+            let body = format!(
+                "pub fn f_{i}() {{\n    let target_symbol = {i};\n    println!(\"target_symbol: {{}}\", target_symbol);\n}}\n"
+            );
+            std::fs::write(file, body).expect("write fixture file");
+        }
+
+        let mut seq_inputs = Vec::new();
+        for _ in 0..8 {
+            seq_inputs.push(serde_json::json!({
+                "path": ".",
+                "query": "target_symbol",
+                "mode": "files",
+                "glob": "**/*.rs",
+                "limit": 200
+            }));
+        }
+
+        let seq_start = Instant::now();
+        for (i, input) in seq_inputs.iter().enumerate() {
+            let result = execute_tool(
+                &format!("seq-{i}"),
+                "grep_search",
+                input,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(root),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(!result.is_error, "sequential grep_search failed: {}", result.content);
+        }
+        let seq_elapsed = seq_start.elapsed();
+
+        let par_inputs = seq_inputs;
+        let par_ids: Vec<String> = (0..par_inputs.len()).map(|i| format!("par-{i}")).collect();
+
+        let par_start = Instant::now();
+        let par_results = join_all(par_ids.iter().zip(par_inputs.iter()).map(|(id, input)| {
+            execute_tool(
+                id,
+                "grep_search",
+                input,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(root),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        }))
+        .await;
+        let par_elapsed = par_start.elapsed();
+
+        for result in par_results {
+            assert!(!result.is_error, "parallel grep_search failed: {}", result.content);
+            assert!(result.content.contains("src/mod_0.rs"));
+        }
+
+        eprintln!(
+            "benchmark_search_tools_parallel_vs_sequential: seq={:?}, par={:?}",
+            seq_elapsed, par_elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_write_read_before_write_guard() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        let path = root.join("guard.txt");
+        std::fs::write(&path, "v1").expect("seed file");
+
+        let denied = execute_tool(
+            "test-id",
+            "file_write",
+            &serde_json::json!({"path": "guard.txt", "content": "v2", "require_read_before_write": true}),
+            None,      // kernel
+            None,      // allowed_tools
+            None,      // caller_agent_id
+            None,      // skill_registry
+            None,      // mcp_connections
+            None,      // web_ctx
+            None,      // browser_ctx
+            None,      // allowed_env_vars
+            Some(root), // workspace_root
+            None,      // media_engine
+            None,      // exec_policy
+            None,      // tts_engine
+            None,      // docker_config
+            None,      // process_manager
+        )
+        .await;
+        assert!(denied.is_error);
+        assert!(denied.content.contains("Read-before-write precondition failed"));
+
+        let read_ok = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": "guard.txt"}),
+            None,      // kernel
+            None,      // allowed_tools
+            None,      // caller_agent_id
+            None,      // skill_registry
+            None,      // mcp_connections
+            None,      // web_ctx
+            None,      // browser_ctx
+            None,      // allowed_env_vars
+            Some(root), // workspace_root
+            None,      // media_engine
+            None,      // exec_policy
+            None,      // tts_engine
+            None,      // docker_config
+            None,      // process_manager
+        )
+        .await;
+        assert!(!read_ok.is_error, "file_read failed: {}", read_ok.content);
+
+        let allowed = execute_tool(
+            "test-id",
+            "file_write",
+            &serde_json::json!({"path": "guard.txt", "content": "v2", "require_read_before_write": true}),
+            None,      // kernel
+            None,      // allowed_tools
+            None,      // caller_agent_id
+            None,      // skill_registry
+            None,      // mcp_connections
+            None,      // web_ctx
+            None,      // browser_ctx
+            None,      // allowed_env_vars
+            Some(root), // workspace_root
+            None,      // media_engine
+            None,      // exec_policy
+            None,      // tts_engine
+            None,      // docker_config
+            None,      // process_manager
+        )
+        .await;
+        assert!(!allowed.is_error, "write should succeed: {}", allowed.content);
+    }
+
+    #[tokio::test]
+    async fn test_file_write_blocks_when_file_changes_after_read() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        let path = root.join("stale.txt");
+        std::fs::write(&path, "v1").expect("seed file");
+
+        let read_ok = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": "stale.txt"}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!read_ok.is_error, "file_read failed: {}", read_ok.content);
+
+        // Simulate an external edit after the agent read the file.
+        std::fs::write(&path, "v2-external").expect("external write");
+
+        let denied = execute_tool(
+            "test-id",
+            "file_write",
+            &serde_json::json!({"path": "stale.txt", "content": "v3-agent", "require_read_before_write": true}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(denied.is_error);
+        assert!(denied.content.contains("file changed after last read"));
+        assert!(denied.content.contains("Re-read the file"));
+    }
+
+    #[tokio::test]
+    async fn test_read_before_write_is_agent_scoped() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        std::fs::write(root.join("agent-scope.txt"), "seed").expect("seed file");
+
+        // Agent A reads the file.
+        let read_by_a = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": "agent-scope.txt"}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!read_by_a.is_error, "read by agent-a failed: {}", read_by_a.content);
+
+        // Agent B should NOT inherit agent A's read state.
+        let write_by_b = execute_tool(
+            "test-id",
+            "file_write",
+            &serde_json::json!({"path": "agent-scope.txt", "content": "b-write", "require_read_before_write": true}),
+            None,
+            None,
+            Some("agent-b"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(write_by_b.is_error);
+        assert!(
+            write_by_b
+                .content
+                .contains("Read-before-write precondition failed")
+        );
+
+        // Agent A can write after its own read.
+        let write_by_a = execute_tool(
+            "test-id",
+            "file_write",
+            &serde_json::json!({"path": "agent-scope.txt", "content": "a-write", "require_read_before_write": true}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!write_by_a.is_error, "write by agent-a failed: {}", write_by_a.content);
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_update_blocks_when_file_changes_after_read() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        let path = root.join("stale_patch_update.txt");
+        std::fs::write(&path, "hello\nworld\n").expect("seed file");
+
+        let read_ok = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": "stale_patch_update.txt"}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!read_ok.is_error, "file_read failed: {}", read_ok.content);
+
+        // External mutation after read.
+        std::fs::write(&path, "hello\nexternal\n").expect("external write");
+
+        let patch = "*** Begin Patch\n*** Update File: stale_patch_update.txt\n@@\n-hello\n+HELLO\n*** End Patch";
+        let denied = execute_tool(
+            "test-id",
+            "apply_patch",
+            &serde_json::json!({"patch": patch, "require_read_before_write": true}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(denied.is_error);
+        assert!(denied.content.contains("file changed after last read"));
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_delete_blocks_when_file_changes_after_read() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        let path = root.join("stale_patch_delete.txt");
+        std::fs::write(&path, "delete-me\n").expect("seed file");
+
+        let read_ok = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": "stale_patch_delete.txt"}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!read_ok.is_error, "file_read failed: {}", read_ok.content);
+
+        // External mutation after read.
+        std::fs::write(&path, "changed-before-delete\n").expect("external write");
+
+        let patch = "*** Begin Patch\n*** Delete File: stale_patch_delete.txt\n*** End Patch";
+        let denied = execute_tool(
+            "test-id",
+            "apply_patch",
+            &serde_json::json!({"patch": patch, "require_read_before_write": true}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(denied.is_error);
+        assert!(denied.content.contains("file changed after last read"));
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_read_then_update_succeeds() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        let path = root.join("patch_success.txt");
+        std::fs::write(&path, "hello\nworld\n").expect("seed file");
+
+        let read_ok = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": "patch_success.txt"}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!read_ok.is_error, "file_read failed: {}", read_ok.content);
+
+        let patch = "*** Begin Patch\n*** Update File: patch_success.txt\n@@\n-hello\n+HELLO\n*** End Patch";
+        let applied = execute_tool(
+            "test-id",
+            "apply_patch",
+            &serde_json::json!({"patch": patch, "require_read_before_write": true}),
+            None,
+            None,
+            Some("agent-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!applied.is_error, "apply_patch should succeed: {}", applied.content);
+        let updated = std::fs::read_to_string(&path).expect("read updated file");
+        assert!(updated.starts_with("HELLO\n"));
+    }
+
+    #[tokio::test]
+    async fn test_coding_tools_disabled_by_exec_policy() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path();
+        std::fs::write(root.join("a.rs"), "fn main() {}\n").expect("seed file");
+
+        let policy = openfang_types::config::ExecPolicy {
+            enable_coding_tools: false,
+            ..Default::default()
+        };
+
+        let result = execute_tool(
+            "test-id",
+            "file_search",
+            &serde_json::json!({"path": ".", "pattern": "**/*.rs"}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(root),
+            None,
+            Some(&policy),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("disabled by exec_policy.enable_coding_tools=false"));
     }
 
     #[tokio::test]

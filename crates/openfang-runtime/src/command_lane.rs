@@ -9,6 +9,106 @@
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// High-level shell command safety class used by coding loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellCommandClass {
+    ReadOnly,
+    Mutating,
+}
+
+/// Classify shell command intent for lane and warning decisions.
+pub fn classify_shell_command(command: &str) -> ShellCommandClass {
+    let tokens = match shlex::split(command) {
+        Some(t) if !t.is_empty() => t,
+        _ => return ShellCommandClass::Mutating,
+    };
+
+    let bin = tokens[0].to_lowercase();
+    let ro_bins = [
+        "ls", "cat", "head", "tail", "pwd", "echo", "grep", "rg", "find", "tree", "wc",
+        "stat", "du", "df", "ps", "top",
+    ];
+    if ro_bins.contains(&bin.as_str()) {
+        return ShellCommandClass::ReadOnly;
+    }
+
+    if bin == "git" {
+        let sub = tokens.get(1).map(|s| s.to_lowercase());
+        let ro_git = [
+            "status", "diff", "show", "log", "branch", "rev-parse", "grep", "ls-files",
+            "remote", "tag", "blame",
+        ];
+        if sub.as_deref().is_some_and(|s| ro_git.contains(&s)) {
+            return ShellCommandClass::ReadOnly;
+        }
+    }
+
+    ShellCommandClass::Mutating
+}
+
+/// Produce non-blocking warning guidance for risky or stall-prone shell commands.
+pub fn shell_command_warning(command: &str, class: ShellCommandClass) -> Option<String> {
+    let cmd = command.to_lowercase();
+
+    let destructive_patterns = [
+        "rm -rf",
+        "mkfs",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        "terraform destroy",
+        "kubectl delete",
+        "drop database",
+        "git reset --hard",
+        "git clean -fd",
+        "git push --force",
+    ];
+    if destructive_patterns.iter().any(|p| cmd.contains(p)) {
+        return Some(
+            "This looks destructive (filesystem, infra, database, or git history rewrite). Verify target scope and confirm intent before continuing."
+                .to_string(),
+        );
+    }
+
+    if let Some(sleep_secs) = parse_sleep_seconds(&cmd) {
+        if sleep_secs >= 30 {
+            return Some(
+                "Long blocking sleep detected. Prefer non-blocking workflows (e.g., process_start + process_poll) to avoid stalling coding loops."
+                    .to_string(),
+            );
+        }
+    }
+
+    if cmd.contains(" tail -f") || cmd.starts_with("tail -f") || cmd.contains(" watch ") {
+        return Some(
+            "Streaming/monitoring command detected. Consider running it in a background process and polling output instead of blocking the turn."
+                .to_string(),
+        );
+    }
+
+    if class == ShellCommandClass::Mutating && cmd.contains("git ") && cmd.contains(" checkout ") {
+        return Some(
+            "Git checkout changes working tree state. Re-read affected files before subsequent edits to avoid stale writes."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn parse_sleep_seconds(command_lc: &str) -> Option<u64> {
+    let tokens: Vec<&str> = command_lc.split_whitespace().collect();
+    for idx in 0..tokens.len() {
+        if tokens[idx] == "sleep" {
+            let next = tokens.get(idx + 1)?;
+            if let Ok(secs) = next.parse::<u64>() {
+                return Some(secs);
+            }
+        }
+    }
+    None
+}
+
 /// Command lane type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
@@ -219,5 +319,34 @@ mod tests {
         assert_eq!(occ[0].capacity, 2);
         assert_eq!(occ[1].capacity, 4);
         assert_eq!(occ[2].capacity, 6);
+    }
+
+    #[test]
+    fn test_classify_shell_command_read_only() {
+        assert_eq!(classify_shell_command("git status"), ShellCommandClass::ReadOnly);
+        assert_eq!(classify_shell_command("rg TODO"), ShellCommandClass::ReadOnly);
+    }
+
+    #[test]
+    fn test_classify_shell_command_mutating() {
+        assert_eq!(
+            classify_shell_command("git checkout -b feature/wave3"),
+            ShellCommandClass::Mutating
+        );
+        assert_eq!(classify_shell_command("cargo build"), ShellCommandClass::Mutating);
+    }
+
+    #[test]
+    fn test_shell_command_warning_destructive() {
+        let msg = shell_command_warning("rm -rf /tmp/demo", ShellCommandClass::Mutating)
+            .expect("destructive warning expected");
+        assert!(msg.contains("destructive"));
+    }
+
+    #[test]
+    fn test_shell_command_warning_anti_stall() {
+        let msg = shell_command_warning("sleep 60", ShellCommandClass::Mutating)
+            .expect("stall warning expected");
+        assert!(msg.contains("Long blocking sleep"));
     }
 }

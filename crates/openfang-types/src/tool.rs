@@ -35,6 +35,34 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+/// Returns true if the tool is read-only (safe for assist mode and parallel batching).
+pub fn is_read_only_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "file_read"
+            | "file_list"
+            | "file_search"
+            | "grep_search"
+            | "code_symbol_refs"
+            | "web_fetch"
+            | "web_search"
+            | "memory_recall"
+            | "agent_list"
+            | "agent_find"
+            | "task_list"
+            | "schedule_list"
+            | "cron_list"
+            | "process_poll"
+            | "process_list"
+            | "system_time"
+    )
+}
+
+/// Returns true if the tool belongs to coding-search capability set.
+pub fn is_coding_tool_name(tool_name: &str) -> bool {
+    matches!(tool_name, "file_search" | "grep_search" | "code_symbol_refs")
+}
+
 /// Normalize a JSON Schema for cross-provider compatibility.
 ///
 /// Some providers (Gemini, Groq) reject `anyOf` in tool schemas.
@@ -306,6 +334,25 @@ mod tests {
         };
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("web_search"));
+    }
+
+    #[test]
+    fn test_is_read_only_tool_name() {
+        assert!(is_read_only_tool_name("file_read"));
+        assert!(is_read_only_tool_name("grep_search"));
+        assert!(is_read_only_tool_name("code_symbol_refs"));
+        assert!(is_read_only_tool_name("agent_find"));
+
+        assert!(!is_read_only_tool_name("file_write"));
+        assert!(!is_read_only_tool_name("shell_exec"));
+    }
+
+    #[test]
+    fn test_is_coding_tool_name() {
+        assert!(is_coding_tool_name("file_search"));
+        assert!(is_coding_tool_name("grep_search"));
+        assert!(is_coding_tool_name("code_symbol_refs"));
+        assert!(!is_coding_tool_name("file_read"));
     }
 
     #[test]

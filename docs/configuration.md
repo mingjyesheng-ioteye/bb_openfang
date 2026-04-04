@@ -1528,6 +1528,135 @@ default_timeout_secs = 300
 |-------|---------|-------------|
 | `default_timeout_secs` | `180` | Seconds of inactivity before marking an agent as unresponsive. Per-agent `heartbeat_interval_secs` in autonomous config overrides this. |
 
+### Exec Policy Safety Flags
+
+`[exec_policy]` controls shell execution behavior and default mutation safety checks.
+
+```toml
+[exec_policy]
+mode = "allowlist"
+require_read_before_write = true
+enable_coding_tools = true
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `mode` | `"allowlist"` | Shell execution policy (`deny`, `allowlist`, `full`). |
+| `require_read_before_write` | `true` | When enabled, `file_write` and `apply_patch` (update/delete ops) require the target file to be read first in the current process session, and block writes if the file content changed after that read. |
+| `enable_coding_tools` | `true` | Feature flag for coding search tools. When false, `file_search`, `grep_search`, and `code_symbol_refs` are hidden from tool lists and rejected at runtime. |
+
+Tool-level override:
+- You can set `require_read_before_write` in individual `file_write` or `apply_patch` tool inputs to explicitly override this default for that call.
+- If a write is rejected as stale, re-run `file_read` on the target and retry with the refreshed content.
+
+### Shell Warning Behavior (Coding Loops)
+
+When `shell_exec` is enabled, OpenFang applies additional coding-loop safety guidance:
+
+- Command classification: shell commands are classified as `read_only` or `mutating`.
+- Parallel batching: read-only shell commands (for example `git status`, `rg`, `ls`) are eligible for read-only parallel batches.
+- Serialization: mutating shell commands remain serialized to reduce race/regression risk.
+- Destructive warning coverage: non-blocking warnings are added for risky patterns such as `rm -rf`, `terraform destroy`, `kubectl delete`, and git history rewrite commands.
+- Anti-stall warning coverage: warnings are added for long blocking waits (`sleep >= 30`) and monitor-style commands (`tail -f`, `watch`).
+
+Recommended pattern for long-running commands:
+
+1. Use `process_start` for long-running tasks.
+2. Use `process_poll` to monitor progress.
+3. Use `process_kill` when cleanup is required.
+
+### Coding Search Tools
+
+OpenFang includes three code-navigation tools for coding agents:
+
+1. `file_search` (glob-style file discovery)
+2. `grep_search` (regex content search with modes)
+3. `code_symbol_refs` (symbol definitions and references)
+
+`code_symbol_refs` prefers LSP-backed symbol providers exposed through connected MCP servers when available, and automatically falls back to heuristic workspace scanning when no compatible provider is connected.
+
+Example calls:
+
+```json
+{
+  "tool": "file_search",
+  "input": {
+    "path": ".",
+    "pattern": "**/*.rs",
+    "limit": 100,
+    "offset": 0
+  }
+}
+```
+
+```json
+{
+  "tool": "grep_search",
+  "input": {
+    "path": ".",
+    "query": "fn run_agent_loop",
+    "mode": "content",
+    "ignore_case": false,
+    "limit": 100,
+    "offset": 0
+  }
+}
+```
+
+```json
+{
+  "tool": "code_symbol_refs",
+  "input": {
+    "path": ".",
+    "symbol": "run_agent_loop",
+    "mode": "all",
+    "limit": 100,
+    "offset": 0
+  }
+}
+```
+
+### Plan Mode + Todo Control Tools
+
+OpenFang provides explicit planning-loop tools for complex coding tasks:
+
+1. `enter_plan_mode` (enable planning mode for the current agent)
+2. `todo_write` (manage a persisted checklist scoped to the current agent)
+3. `exit_plan_mode` (disable planning mode; can be approval-gated)
+
+`exit_plan_mode` can be gated with approval policy:
+
+```toml
+[approval]
+require_approval = ["exit_plan_mode"]
+```
+
+Example calls:
+
+```json
+{
+  "tool": "enter_plan_mode",
+  "input": {}
+}
+```
+
+```json
+{
+  "tool": "todo_write",
+  "input": {
+    "action": "add",
+    "item": "Implement endpoint tests"
+  }
+}
+```
+
+```json
+{
+  "tool": "exit_plan_mode",
+  "input": {}
+}
+```
+
 ### Autonomous Guardrails (per-agent manifest)
 
 Configured in agent manifests via `AutonomousConfig`:

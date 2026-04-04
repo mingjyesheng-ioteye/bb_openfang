@@ -13,8 +13,13 @@ pub fn map_tool_name(openclaw_name: &str) -> Option<&'static str> {
         "Read" | "read" | "read_file" => Some("file_read"),
         "Write" | "write" | "write_file" => Some("file_write"),
         "Edit" | "edit" => Some("file_write"),
-        "Glob" | "glob" | "list_files" => Some("file_list"),
-        "Grep" | "grep" => Some("file_list"),
+        "Glob" | "glob" => Some("file_search"),
+        "list_files" => Some("file_list"),
+        "Grep" | "grep" => Some("grep_search"),
+        "CodeSymbolRefs" | "symbol_refs" | "symbol_references" => Some("code_symbol_refs"),
+        "EnterPlanMode" | "enter_plan_mode" => Some("enter_plan_mode"),
+        "ExitPlanMode" | "exit_plan_mode" => Some("exit_plan_mode"),
+        "TodoWrite" | "todo_write" => Some("todo_write"),
         "Bash" | "bash" | "exec" | "execute_command" => Some("shell_exec"),
         "WebSearch" | "web_search" => Some("web_search"),
         "WebFetch" | "fetch_url" | "web_fetch" => Some("web_fetch"),
@@ -29,6 +34,9 @@ pub fn map_tool_name(openclaw_name: &str) -> Option<&'static str> {
         "fs-read" | "fs_read" | "fsRead" | "readFile" => Some("file_read"),
         "fs-write" | "fs_write" | "fsWrite" | "writeFile" => Some("file_write"),
         "fs-list" | "fs_list" | "fsList" | "listFiles" | "list_dir" | "ls" => Some("file_list"),
+        "file_search" | "glob_search" | "find_files" => Some("file_search"),
+        "grep_search" | "search_code" | "ripgrep" => Some("grep_search"),
+        "code_symbol_refs" | "find_symbol_refs" | "symbol_search" => Some("code_symbol_refs"),
         "fs-exec" | "run" | "run_command" | "runCommand" | "execute" | "shell" => {
             Some("shell_exec")
         }
@@ -56,6 +64,12 @@ pub fn is_known_openfang_tool(name: &str) -> bool {
         "file_read"
             | "file_write"
             | "file_list"
+            | "file_search"
+            | "grep_search"
+            | "code_symbol_refs"
+            | "enter_plan_mode"
+            | "exit_plan_mode"
+            | "todo_write"
             | "shell_exec"
             | "web_search"
             | "web_fetch"
@@ -90,8 +104,12 @@ mod tests {
         assert_eq!(map_tool_name("Read"), Some("file_read"));
         assert_eq!(map_tool_name("Write"), Some("file_write"));
         assert_eq!(map_tool_name("Edit"), Some("file_write"));
-        assert_eq!(map_tool_name("Glob"), Some("file_list"));
-        assert_eq!(map_tool_name("Grep"), Some("file_list"));
+        assert_eq!(map_tool_name("Glob"), Some("file_search"));
+        assert_eq!(map_tool_name("Grep"), Some("grep_search"));
+        assert_eq!(map_tool_name("CodeSymbolRefs"), Some("code_symbol_refs"));
+        assert_eq!(map_tool_name("EnterPlanMode"), Some("enter_plan_mode"));
+        assert_eq!(map_tool_name("ExitPlanMode"), Some("exit_plan_mode"));
+        assert_eq!(map_tool_name("TodoWrite"), Some("todo_write"));
         assert_eq!(map_tool_name("Bash"), Some("shell_exec"));
         assert_eq!(map_tool_name("WebSearch"), Some("web_search"));
         assert_eq!(map_tool_name("WebFetch"), Some("web_fetch"));
@@ -100,8 +118,9 @@ mod tests {
         assert_eq!(map_tool_name("read"), Some("file_read"));
         assert_eq!(map_tool_name("write"), Some("file_write"));
         assert_eq!(map_tool_name("edit"), Some("file_write"));
-        assert_eq!(map_tool_name("glob"), Some("file_list"));
-        assert_eq!(map_tool_name("grep"), Some("file_list"));
+        assert_eq!(map_tool_name("glob"), Some("file_search"));
+        assert_eq!(map_tool_name("grep"), Some("grep_search"));
+        assert_eq!(map_tool_name("symbol_refs"), Some("code_symbol_refs"));
         assert_eq!(map_tool_name("bash"), Some("shell_exec"));
         assert_eq!(map_tool_name("exec"), Some("shell_exec"));
         assert_eq!(map_tool_name("execute_command"), Some("shell_exec"));
@@ -110,6 +129,12 @@ mod tests {
         assert_eq!(map_tool_name("read_file"), Some("file_read"));
         assert_eq!(map_tool_name("write_file"), Some("file_write"));
         assert_eq!(map_tool_name("list_files"), Some("file_list"));
+        assert_eq!(map_tool_name("file_search"), Some("file_search"));
+        assert_eq!(map_tool_name("grep_search"), Some("grep_search"));
+        assert_eq!(map_tool_name("code_symbol_refs"), Some("code_symbol_refs"));
+        assert_eq!(map_tool_name("enter_plan_mode"), Some("enter_plan_mode"));
+        assert_eq!(map_tool_name("exit_plan_mode"), Some("exit_plan_mode"));
+        assert_eq!(map_tool_name("todo_write"), Some("todo_write"));
         assert_eq!(map_tool_name("fetch_url"), Some("web_fetch"));
         assert_eq!(map_tool_name("web_fetch"), Some("web_fetch"));
         assert_eq!(map_tool_name("web_search"), Some("web_search"));
@@ -157,6 +182,12 @@ mod tests {
         // Known OpenFang tools pass through unchanged
         assert_eq!(normalize_tool_name("file_read"), "file_read");
         assert_eq!(normalize_tool_name("file_write"), "file_write");
+        assert_eq!(normalize_tool_name("file_search"), "file_search");
+        assert_eq!(normalize_tool_name("grep_search"), "grep_search");
+        assert_eq!(normalize_tool_name("code_symbol_refs"), "code_symbol_refs");
+        assert_eq!(normalize_tool_name("enter_plan_mode"), "enter_plan_mode");
+        assert_eq!(normalize_tool_name("exit_plan_mode"), "exit_plan_mode");
+        assert_eq!(normalize_tool_name("todo_write"), "todo_write");
         assert_eq!(normalize_tool_name("shell_exec"), "shell_exec");
         assert_eq!(normalize_tool_name("web_search"), "web_search");
 
@@ -180,6 +211,12 @@ mod tests {
             "file_read",
             "file_write",
             "file_list",
+            "file_search",
+            "grep_search",
+            "code_symbol_refs",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "todo_write",
             "shell_exec",
             "web_search",
             "web_fetch",
