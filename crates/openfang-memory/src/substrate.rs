@@ -614,6 +614,126 @@ impl MemorySubstrate {
         .await
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
+
+    /// Get a single task by ID.
+    pub async fn task_get(&self, task_id: &str) -> OpenFangResult<Option<serde_json::Value>> {
+        let conn = Arc::clone(&self.conn);
+        let task_id = task_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let mut stmt = db
+                .prepare(
+                    "SELECT id, title, description, status, assigned_to, created_by, created_at, completed_at, result
+                     FROM task_queue WHERE id = ?1",
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            let row = stmt.query_row(rusqlite::params![task_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "title": r.get::<_, String>(1).unwrap_or_default(),
+                    "description": r.get::<_, String>(2).unwrap_or_default(),
+                    "status": r.get::<_, String>(3)?,
+                    "assigned_to": r.get::<_, String>(4).unwrap_or_default(),
+                    "created_by": r.get::<_, String>(5).unwrap_or_default(),
+                    "created_at": r.get::<_, String>(6).unwrap_or_default(),
+                    "completed_at": r.get::<_, Option<String>>(7).unwrap_or(None),
+                    "result": r.get::<_, Option<String>>(8).unwrap_or(None),
+                }))
+            });
+
+            match row {
+                Ok(task) => Ok(Some(task)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(OpenFangError::Memory(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Update mutable task fields and return the updated task.
+    pub async fn task_update(
+        &self,
+        task_id: &str,
+        status: Option<&str>,
+        title: Option<&str>,
+        description: Option<&str>,
+        assigned_to: Option<&str>,
+        result: Option<&str>,
+    ) -> OpenFangResult<Option<serde_json::Value>> {
+        let conn = Arc::clone(&self.conn);
+        let task_id = task_id.to_string();
+        let status = status.map(|s| s.to_string());
+        let title = title.map(|s| s.to_string());
+        let description = description.map(|s| s.to_string());
+        let assigned_to = assigned_to.map(|s| s.to_string());
+        let result = result.map(|s| s.to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().to_rfc3339();
+            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+            let rows = db
+                .execute(
+                    "UPDATE task_queue
+                     SET
+                       status = COALESCE(?2, status),
+                       title = COALESCE(?3, title),
+                       description = COALESCE(?4, description),
+                       assigned_to = COALESCE(?5, assigned_to),
+                       result = COALESCE(?6, result),
+                       completed_at = CASE
+                         WHEN COALESCE(?2, status) = 'completed' THEN COALESCE(completed_at, ?7)
+                         WHEN COALESCE(?2, status) = 'canceled' THEN COALESCE(completed_at, ?7)
+                         ELSE completed_at
+                       END
+                     WHERE id = ?1",
+                    rusqlite::params![
+                        task_id,
+                        status,
+                        title,
+                        description,
+                        assigned_to,
+                        result,
+                        now
+                    ],
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            if rows == 0 {
+                return Ok(None);
+            }
+
+            let mut stmt = db
+                .prepare(
+                    "SELECT id, title, description, status, assigned_to, created_by, created_at, completed_at, result
+                     FROM task_queue WHERE id = ?1",
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            let task = stmt
+                .query_row(rusqlite::params![task_id], |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "title": r.get::<_, String>(1).unwrap_or_default(),
+                        "description": r.get::<_, String>(2).unwrap_or_default(),
+                        "status": r.get::<_, String>(3)?,
+                        "assigned_to": r.get::<_, String>(4).unwrap_or_default(),
+                        "created_by": r.get::<_, String>(5).unwrap_or_default(),
+                        "created_at": r.get::<_, String>(6).unwrap_or_default(),
+                        "completed_at": r.get::<_, Option<String>>(7).unwrap_or(None),
+                        "result": r.get::<_, Option<String>>(8).unwrap_or(None),
+                    }))
+                })
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            Ok(Some(task))
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
 }
 
 #[async_trait]
@@ -820,5 +940,40 @@ mod tests {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
         let claimed = substrate.task_claim("nobody").await.unwrap();
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_task_get_and_update() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let task_id = substrate
+            .task_post(
+                "Implement Wave 4",
+                "Add task lifecycle tools",
+                Some("coder"),
+                Some("planner"),
+            )
+            .await
+            .unwrap();
+
+        let fetched = substrate.task_get(&task_id).await.unwrap().expect("task exists");
+        assert_eq!(fetched["title"], "Implement Wave 4");
+        assert_eq!(fetched["status"], "pending");
+
+        let updated = substrate
+            .task_update(
+                &task_id,
+                Some("in_progress"),
+                Some("Implement Wave 4 Track J"),
+                None,
+                Some("coder"),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("task updated");
+
+        assert_eq!(updated["status"], "in_progress");
+        assert_eq!(updated["title"], "Implement Wave 4 Track J");
+        assert_eq!(updated["assigned_to"], "coder");
     }
 }

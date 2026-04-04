@@ -70,12 +70,89 @@ pub trait KernelHandle: Send + Sync {
     /// List tasks, optionally filtered by status.
     async fn task_list(&self, status: Option<&str>) -> Result<Vec<serde_json::Value>, String>;
 
+    /// Get a single task by ID.
+    async fn task_get(&self, task_id: &str) -> Result<Option<serde_json::Value>, String> {
+        let tasks = self.task_list(None).await?;
+        Ok(tasks
+            .into_iter()
+            .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(task_id)))
+    }
+
+    /// Update a task's mutable fields and return the updated task.
+    async fn task_update(
+        &self,
+        task_id: &str,
+        status: Option<&str>,
+        title: Option<&str>,
+        description: Option<&str>,
+        assigned_to: Option<&str>,
+        result: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let _ = (title, description, assigned_to);
+
+        if let Some("completed") = status {
+            let completion_result = result.unwrap_or("Completed via task_update");
+            self.task_complete(task_id, completion_result).await?;
+            return self.task_get(task_id).await;
+        }
+
+        if status.is_some() || result.is_some() {
+            return Err(
+                "Task update for this kernel only supports status='completed' via task_complete"
+                    .to_string(),
+            );
+        }
+
+        self.task_get(task_id).await
+    }
+
+    /// Return task output/result if present.
+    async fn task_output(&self, task_id: &str) -> Result<Option<String>, String> {
+        let task = self.task_get(task_id).await?;
+        Ok(task.and_then(|t| {
+            let raw = t.get("result").and_then(|v| v.as_str())?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }))
+    }
+
+    /// Stop/cancel a task and optionally set a reason.
+    async fn task_stop(&self, task_id: &str, reason: Option<&str>) -> Result<(), String> {
+        let _ = reason;
+        let _ = self.task_update(task_id, Some("canceled"), None, None, None, reason).await?;
+        Ok(())
+    }
+
     /// Publish a custom event that can trigger proactive agents.
     async fn publish_event(
         &self,
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<(), String>;
+
+    /// Compact an agent session using the kernel's session compaction pipeline.
+    async fn compact_agent_session(&self, agent_id: &str) -> Result<String, String> {
+        let _ = agent_id;
+        Err("Session compaction not available".to_string())
+    }
+
+    /// Run global memory consolidation and return a report.
+    async fn memory_consolidate(&self) -> Result<openfang_types::memory::ConsolidationReport, String> {
+        Err("Memory consolidation not available".to_string())
+    }
+
+    /// Generate a context usage report for an agent's active session.
+    async fn context_report(
+        &self,
+        agent_id: &str,
+    ) -> Result<crate::compactor::ContextReport, String> {
+        let _ = agent_id;
+        Err("Context report not available".to_string())
+    }
 
     /// Add an entity to the knowledge graph.
     async fn knowledge_add_entity(

@@ -75,6 +75,7 @@ $syntheticSeq = @()
 $syntheticPar = @()
 $scenarioSeq = @()
 $scenarioPar = @()
+$compactionElapsed = @()
 
 Write-Host "Running coding latency summary over $Runs run(s)..." -ForegroundColor Cyan
 for ($i = 1; $i -le $Runs; $i++) {
@@ -88,14 +89,42 @@ for ($i = 1; $i -le $Runs; $i++) {
         -TestName "benchmark_search_tools_parallel_vs_sequential" `
         -Pattern "benchmark_search_tools_parallel_vs_sequential"
 
+    $compactionCmd = "cargo test -p openfang-runtime --lib benchmark_compaction_long_session_latency -- --ignored --nocapture 2>&1"
+    $compactionOutput = & cmd /c $compactionCmd
+    if ($LASTEXITCODE -ne 0) {
+        throw "Benchmark test failed: benchmark_compaction_long_session_latency"
+    }
+    $compactionLine = ($compactionOutput | Select-String -Pattern "benchmark_compaction_long_session_latency" | Select-Object -First 1)
+    if (-not $compactionLine) {
+        throw "Could not parse benchmark output for benchmark_compaction_long_session_latency"
+    }
+    $cm = [regex]::Match($compactionLine.ToString(), 'elapsed=(?<elapsed>[0-9]+)ms')
+    if (-not $cm.Success) {
+        throw "Compaction timing pattern not found"
+    }
+
     $syntheticSeq += $synthetic.SeqMs
     $syntheticPar += $synthetic.ParMs
     $scenarioSeq += $scenario.SeqMs
     $scenarioPar += $scenario.ParMs
+    $compactionElapsed += [double]$cm.Groups['elapsed'].Value
 }
 
 $syntheticSummary = Get-StatSummary -Seq $syntheticSeq -Par $syntheticPar
 $scenarioSummary = Get-StatSummary -Seq $scenarioSeq -Par $scenarioPar
+$compactionSorted = $compactionElapsed | Sort-Object
+$nCompaction = $compactionSorted.Count
+$cMedianA = [int][math]::Floor(($nCompaction - 1) / 2)
+$cMedianB = [int][math]::Ceiling(($nCompaction - 1) / 2)
+$cP95 = [int][math]::Ceiling(0.95 * $nCompaction) - 1
+if ($cP95 -lt 0) { $cP95 = 0 }
+if ($cP95 -ge $nCompaction) { $cP95 = $nCompaction - 1 }
+
+$compactionSummary = [pscustomobject]@{
+    Runs = $nCompaction
+    CompactionMedianMs = [math]::Round((($compactionSorted[$cMedianA] + $compactionSorted[$cMedianB]) / 2.0), 3)
+    CompactionP95Ms = [math]::Round($compactionSorted[$cP95], 3)
+}
 
 Write-Host ""
 Write-Host "Synthetic Batch Benchmark Summary" -ForegroundColor Green
@@ -104,3 +133,7 @@ $syntheticSummary | Format-Table -AutoSize
 Write-Host ""
 Write-Host "Scenario Search Benchmark Summary" -ForegroundColor Green
 $scenarioSummary | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "Long-session Compaction Benchmark Summary" -ForegroundColor Green
+$compactionSummary | Format-Table -AutoSize

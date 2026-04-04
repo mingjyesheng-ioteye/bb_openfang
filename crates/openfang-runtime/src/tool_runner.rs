@@ -268,6 +268,55 @@ pub fn current_agent_depth() -> u32 {
     AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0)
 }
 
+fn format_permission_error(code: &str, message: &str, policy: &str, remediation: &str) -> String {
+    format!(
+        "PERMISSION_DENIED[{code}] {message}\nPolicy: {policy}\nRemediation: {remediation}"
+    )
+}
+
+fn classify_tool_failure(err: &str) -> (&'static str, &'static str) {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("permission_denied[") || lower.contains("permission denied") {
+        ("permission_denied", "no_retry")
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        ("timeout", "retryable")
+    } else if lower.contains("invalid") || lower.contains("missing '") {
+        ("invalid_input", "no_retry")
+    } else if lower.contains("mcp") && lower.contains("not connected") {
+        ("mcp_not_connected", "retry_after_reconnect")
+    } else if lower.contains("mcp") && lower.contains("not available") {
+        ("mcp_not_available", "retry_after_config")
+    } else if lower.contains("mcp") && lower.contains("invalid mcp tool name") {
+        ("mcp_invalid_tool", "no_retry")
+    } else if lower.contains("mcp") {
+        ("mcp_call_failed", "retryable")
+    } else {
+        ("tool_error", "retryable")
+    }
+}
+
+fn format_mcp_call_error(message: &str) -> String {
+    let hint = mcp::call_hint(message);
+    format!("{message}\nMCP_HINT: {hint}")
+}
+
+fn emit_tool_slo(
+    tool_name: &str,
+    start: Instant,
+    outcome: &str,
+    failure_code: Option<&str>,
+    retry_class: Option<&str>,
+) {
+    debug!(
+        tool = tool_name,
+        elapsed_ms = start.elapsed().as_millis(),
+        outcome,
+        failure_code = failure_code.unwrap_or("none"),
+        retry_class = retry_class.unwrap_or("none"),
+        "tool_execution_slo"
+    );
+}
+
 /// Execute a tool by name with the given input, returning a ToolResult.
 ///
 /// The optional `kernel` handle enables inter-agent tools. If `None`,
@@ -299,18 +348,29 @@ pub async fn execute_tool(
     // Normalize the tool name through compat mappings so LLM-hallucinated aliases
     // (e.g. "fs-write" → "file_write") resolve to the canonical OpenFang name.
     let tool_name = normalize_tool_name(tool_name);
+    let started = Instant::now();
 
     // Capability enforcement: reject tools not in the allowed list
     if let Some(allowed) = allowed_tools {
         if !allowed.iter().any(|t| t == tool_name) {
             warn!(tool_name, "Capability denied: tool not in allowed list");
-            return ToolResult {
+            let denied = ToolResult {
                 tool_use_id: tool_use_id.to_string(),
-                content: format!(
-                    "Permission denied: agent does not have capability to use tool '{tool_name}'"
+                content: format_permission_error(
+                    "CAPABILITY_NOT_GRANTED",
+                    &format!(
+                        "Permission denied: agent does not have capability to use tool '{tool_name}'"
+                    ),
+                    &format!(
+                        "capabilities.tools does not include '{tool_name}' (allowed_tools_count={})",
+                        allowed.len()
+                    ),
+                    "Grant this tool in the agent capabilities.tools list, or use an allowed alternative tool.",
                 ),
                 is_error: true,
             };
+            emit_tool_slo(tool_name, started, "error", Some("permission_denied"), Some("no_retry"));
+            return denied;
         }
     }
 
@@ -323,14 +383,21 @@ pub async fn execute_tool(
             tool = tool_name,
             "Coding tool blocked by exec_policy.enable_coding_tools=false"
         );
-        return ToolResult {
+        let denied = ToolResult {
             tool_use_id: tool_use_id.to_string(),
-            content: format!(
-                "Tool '{}' is disabled by exec_policy.enable_coding_tools=false",
-                tool_name
+            content: format_permission_error(
+                "CODING_TOOLS_DISABLED",
+                &format!(
+                    "Tool '{}' is disabled by exec_policy.enable_coding_tools=false",
+                    tool_name
+                ),
+                "exec_policy.enable_coding_tools = false",
+                "Enable coding tools in [exec_policy] with enable_coding_tools = true, or choose a non-coding tool.",
             ),
             is_error: true,
         };
+        emit_tool_slo(tool_name, started, "error", Some("permission_denied"), Some("no_retry"));
+        return denied;
     }
 
     // Approval gate: check if this tool requires human approval before execution.
@@ -368,22 +435,40 @@ pub async fn execute_tool(
                 }
                 Ok(false) => {
                     warn!(tool_name, "Approval denied — blocking tool execution");
-                    return ToolResult {
+                    let denied = ToolResult {
                         tool_use_id: tool_use_id.to_string(),
-                        content: format!(
-                            "Execution denied: '{}' requires human approval and was denied or timed out. The operation was not performed.",
-                            tool_name
+                        content: format_permission_error(
+                            "APPROVAL_DENIED_OR_TIMED_OUT",
+                            &format!(
+                                "Execution denied: '{}' requires human approval and was denied or timed out. The operation was not performed.",
+                                tool_name
+                            ),
+                            &format!(
+                                "approval gate matched for '{tool_name}' (requires_approval=true, exec_policy bypass inactive)"
+                            ),
+                            "Request user approval for this action, or change [approval].require_approval / [approval].auto_approve policy.",
                         ),
                         is_error: true,
                     };
+                    emit_tool_slo(tool_name, started, "error", Some("approval_denied"), Some("no_retry"));
+                    return denied;
                 }
                 Err(e) => {
                     warn!(tool_name, error = %e, "Approval system error");
-                    return ToolResult {
+                    let denied = ToolResult {
                         tool_use_id: tool_use_id.to_string(),
-                        content: format!("Approval system error: {e}"),
+                        content: format_permission_error(
+                            "APPROVAL_SYSTEM_ERROR",
+                            &format!("Approval system error: {e}"),
+                            &format!(
+                                "approval gate matched for '{tool_name}' but approval backend returned an error"
+                            ),
+                            "Check kernel approval queue health and configuration, then retry.",
+                        ),
                         is_error: true,
                     };
+                    emit_tool_slo(tool_name, started, "error", Some("approval_system_error"), Some("retryable"));
+                    return denied;
                 }
             }
         }
@@ -402,6 +487,9 @@ pub async fn execute_tool(
         "code_symbol_refs" => {
             tool_code_symbol_refs(input, workspace_root, mcp_connections).await
         }
+        "mcp_resource_list" => tool_mcp_resource_list(input, mcp_connections).await,
+        "mcp_resource_read" => tool_mcp_resource_read(input, mcp_connections).await,
+        "mcp_diagnostics" => tool_mcp_diagnostics(mcp_connections).await,
         "apply_patch" => {
             tool_apply_patch(input, workspace_root, caller_agent_id, exec_policy).await
         }
@@ -513,6 +601,7 @@ pub async fn execute_tool(
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
+        "memory_compact" => tool_memory_compact(input, kernel, caller_agent_id).await,
         "enter_plan_mode" => tool_enter_plan_mode(kernel, caller_agent_id),
         "exit_plan_mode" => tool_exit_plan_mode(kernel, caller_agent_id),
         "todo_write" => tool_todo_write(input, kernel, caller_agent_id),
@@ -523,6 +612,11 @@ pub async fn execute_tool(
         "task_claim" => tool_task_claim(kernel, caller_agent_id).await,
         "task_complete" => tool_task_complete(input, kernel).await,
         "task_list" => tool_task_list(input, kernel).await,
+        "task_create" => tool_task_create(input, kernel, caller_agent_id).await,
+        "task_get" => tool_task_get(input, kernel).await,
+        "task_update" => tool_task_update(input, kernel).await,
+        "task_output" => tool_task_output(input, kernel).await,
+        "task_stop" => tool_task_stop(input, kernel).await,
         "event_publish" => tool_event_publish(input, kernel).await,
 
         // Scheduling tools
@@ -711,16 +805,20 @@ pub async fn execute_tool(
                             );
                             match conn.call_tool(other, input).await {
                                 Ok(content) => Ok(content),
-                                Err(e) => Err(format!("MCP tool call failed: {e}")),
+                                Err(e) => Err(format_mcp_call_error(&format!(
+                                    "MCP tool call failed: {e}"
+                                ))),
                             }
                         } else {
-                            Err(format!("MCP server '{server_name}' not connected"))
+                            Err(format_mcp_call_error(&format!(
+                                "MCP server '{server_name}' not connected"
+                            )))
                         }
                     } else {
-                        Err(format!("Invalid MCP tool name: {other}"))
+                        Err(format_mcp_call_error(&format!("Invalid MCP tool name: {other}")))
                     }
                 } else {
-                    Err(format!("MCP not available for tool: {other}"))
+                    Err(format_mcp_call_error(&format!("MCP not available for tool: {other}")))
                 }
             }
             // Fallback 2: Skill registry tool providers
@@ -756,16 +854,29 @@ pub async fn execute_tool(
     };
 
     match result {
-        Ok(content) => ToolResult {
-            tool_use_id: tool_use_id.to_string(),
-            content,
-            is_error: false,
-        },
-        Err(err) => ToolResult {
-            tool_use_id: tool_use_id.to_string(),
-            content: format!("Error: {err}"),
-            is_error: true,
-        },
+        Ok(content) => {
+            emit_tool_slo(tool_name, started, "ok", None, None);
+            ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content,
+                is_error: false,
+            }
+        }
+        Err(err) => {
+            let (failure_code, retry_class) = classify_tool_failure(&err);
+            emit_tool_slo(
+                tool_name,
+                started,
+                "error",
+                Some(failure_code),
+                Some(retry_class),
+            );
+            ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Error: {err}"),
+                is_error: true,
+            }
+        }
     }
 }
 
@@ -852,6 +963,37 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "offset": { "type": "integer", "description": "Skip first N results before returning output" }
                 },
                 "required": ["symbol"]
+            }),
+        },
+        ToolDefinition {
+            name: "mcp_resource_list".to_string(),
+            description: "List resources exposed by a connected MCP server.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string", "description": "MCP server name as configured in mcp_servers" }
+                },
+                "required": ["server"]
+            }),
+        },
+        ToolDefinition {
+            name: "mcp_resource_read".to_string(),
+            description: "Read an MCP resource by URI from a connected server.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string", "description": "MCP server name as configured in mcp_servers" },
+                    "uri": { "type": "string", "description": "Resource URI to read" }
+                },
+                "required": ["server", "uri"]
+            }),
+        },
+        ToolDefinition {
+            name: "mcp_diagnostics".to_string(),
+            description: "Report connected MCP servers, tool counts, and quick remediation hints when none are connected.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
             }),
         },
         ToolDefinition {
@@ -979,6 +1121,16 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "memory_compact".to_string(),
+            description: "Compact memory/session state. Modes: 'session' compacts this agent session, 'global' runs memory consolidation, 'status' reports context pressure, and 'auto' compacts only when pressure is high/critical.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string", "description": "One of: session, global, status, auto (default: session)" }
+                }
+            }),
+        },
+        ToolDefinition {
             name: "enter_plan_mode".to_string(),
             description: "Enter plan mode for this agent. Use before implementation on complex tasks to keep work checklist-driven.".to_string(),
             input_schema: serde_json::json!({
@@ -1059,6 +1211,69 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "status": { "type": "string", "description": "Filter by status: pending, in_progress, completed (optional)" }
                 }
+            }),
+        },
+        ToolDefinition {
+            name: "task_create".to_string(),
+            description: "Create a task in the shared queue. Alias of task_post for lifecycle-oriented flows.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short task title" },
+                    "description": { "type": "string", "description": "Detailed task description" },
+                    "assigned_to": { "type": "string", "description": "Agent name or ID to assign the task to (optional)" }
+                },
+                "required": ["title", "description"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_get".to_string(),
+            description: "Fetch a single task by ID.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task ID to fetch" }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_update".to_string(),
+            description: "Update mutable task fields (status/title/description/assigned_to/result).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task ID to update" },
+                    "status": { "type": "string", "description": "New status: pending, in_progress, completed, canceled" },
+                    "title": { "type": "string", "description": "New task title (optional)" },
+                    "description": { "type": "string", "description": "New task description (optional)" },
+                    "assigned_to": { "type": "string", "description": "New assignee (optional)" },
+                    "result": { "type": "string", "description": "Result or output text (optional)" }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_output".to_string(),
+            description: "Return the output/result of a task by ID.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task ID to read output from" }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_stop".to_string(),
+            description: "Stop/cancel a task by ID and optionally store a reason.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task ID to stop" },
+                    "reason": { "type": "string", "description": "Optional stop/cancel reason" }
+                },
+                "required": ["task_id"]
             }),
         },
         ToolDefinition {
@@ -1994,6 +2209,85 @@ async fn tool_code_symbol_refs(
     ))
 }
 
+async fn tool_mcp_resource_list(
+    input: &serde_json::Value,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+) -> Result<String, String> {
+    let server = input["server"]
+        .as_str()
+        .ok_or("Missing 'server' parameter")?;
+    let mcp_connections = mcp_connections
+        .ok_or_else(|| format_mcp_call_error("MCP not available for mcp_resource_list"))?;
+
+    let mut conns = mcp_connections.lock().await;
+    let conn = conns
+        .iter_mut()
+        .find(|c| c.name() == server)
+        .ok_or_else(|| format_mcp_call_error(&format!("MCP server '{server}' not connected")))?;
+
+    let resources = conn
+        .list_resources()
+        .await
+        .map_err(|e| format_mcp_call_error(&e))?;
+
+    serde_json::to_string_pretty(&resources).map_err(|e| format!("Serialize error: {e}"))
+}
+
+async fn tool_mcp_resource_read(
+    input: &serde_json::Value,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+) -> Result<String, String> {
+    let server = input["server"]
+        .as_str()
+        .ok_or("Missing 'server' parameter")?;
+    let uri = input["uri"].as_str().ok_or("Missing 'uri' parameter")?;
+    let mcp_connections = mcp_connections
+        .ok_or_else(|| format_mcp_call_error("MCP not available for mcp_resource_read"))?;
+
+    let mut conns = mcp_connections.lock().await;
+    let conn = conns
+        .iter_mut()
+        .find(|c| c.name() == server)
+        .ok_or_else(|| format_mcp_call_error(&format!("MCP server '{server}' not connected")))?;
+
+    conn.read_resource(uri)
+        .await
+        .map_err(|e| format_mcp_call_error(&e))
+}
+
+async fn tool_mcp_diagnostics(
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+) -> Result<String, String> {
+    let mcp_connections = mcp_connections
+        .ok_or_else(|| format_mcp_call_error("MCP not available for diagnostics"))?;
+    let conns = mcp_connections.lock().await;
+
+    if conns.is_empty() {
+        return Ok(
+            "MCP diagnostics:\n- connected_servers: 0\n- hint: verify [[mcp_servers]] config, transport command/url, and auth env/header settings."
+                .to_string(),
+        );
+    }
+
+    let servers: Vec<serde_json::Value> = conns
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name(),
+                "tool_count": c.tools().len(),
+            })
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "connected_servers": conns.len(),
+        "servers": servers,
+        "hint": "Use mcp_resource_list to discover URIs, then mcp_resource_read for content fetch."
+    });
+
+    serde_json::to_string_pretty(&payload).map_err(|e| format!("Serialize error: {e}"))
+}
+
 fn lsp_mcp_candidate_tools(tool_names: &[String], mode: &str) -> Vec<String> {
     let mut defs = Vec::new();
     let mut refs = Vec::new();
@@ -2504,6 +2798,51 @@ fn tool_memory_recall(
     }
 }
 
+async fn tool_memory_compact(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let mode = input["mode"].as_str().unwrap_or("session");
+    let agent_id = caller_agent_id
+        .filter(|s| !s.is_empty())
+        .ok_or("Missing caller agent context".to_string())?;
+
+    match mode {
+        "session" => kh.compact_agent_session(agent_id).await,
+        "global" => {
+            let report = kh.memory_consolidate().await?;
+            Ok(format!(
+                "Memory consolidation complete: merged={}, decayed={}, duration_ms={}",
+                report.memories_merged, report.memories_decayed, report.duration_ms
+            ))
+        }
+        "status" => {
+            let report = kh.context_report(agent_id).await?;
+            serde_json::to_string_pretty(&report).map_err(|e| format!("Serialize error: {e}"))
+        }
+        "auto" => {
+            let report = kh.context_report(agent_id).await?;
+            match report.pressure {
+                crate::compactor::ContextPressure::High
+                | crate::compactor::ContextPressure::Critical => {
+                    let compacted = kh.compact_agent_session(agent_id).await?;
+                    Ok(format!(
+                        "Auto compaction triggered at {:?} pressure. {}",
+                        report.pressure, compacted
+                    ))
+                }
+                _ => Ok(format!(
+                    "Auto compaction skipped at {:?} pressure (usage {:.1}%). {}",
+                    report.pressure, report.usage_percent, report.recommendation
+                )),
+            }
+        }
+        _ => Err("Invalid mode. Expected one of: session, global, status, auto".to_string()),
+    }
+}
+
 fn require_caller_agent_id(caller_agent_id: Option<&str>) -> Result<&str, String> {
     caller_agent_id
         .filter(|s| !s.is_empty())
@@ -2701,6 +3040,14 @@ async fn tool_task_post(
     Ok(format!("Task created with ID: {task_id}"))
 }
 
+async fn tool_task_create(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    tool_task_post(input, kernel, caller_agent_id).await
+}
+
 async fn tool_task_claim(
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
@@ -2741,6 +3088,89 @@ async fn tool_task_list(
         return Ok("No tasks found.".to_string());
     }
     serde_json::to_string_pretty(&tasks).map_err(|e| format!("Serialize error: {e}"))
+}
+
+async fn tool_task_get(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let task_id = input["task_id"]
+        .as_str()
+        .ok_or("Missing 'task_id' parameter")?;
+    let task = kh.task_get(task_id).await?;
+    match task {
+        Some(task) => serde_json::to_string_pretty(&task).map_err(|e| format!("Serialize error: {e}")),
+        None => Ok(format!("Task not found: {task_id}")),
+    }
+}
+
+async fn tool_task_update(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let task_id = input["task_id"]
+        .as_str()
+        .ok_or("Missing 'task_id' parameter")?;
+    let status = input["status"].as_str();
+    if let Some(s) = status {
+        match s {
+            "pending" | "in_progress" | "completed" | "canceled" => {}
+            _ => {
+                return Err(
+                    "Invalid status. Expected one of: pending, in_progress, completed, canceled"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let title = input["title"].as_str();
+    let description = input["description"].as_str();
+    let assigned_to = input["assigned_to"].as_str();
+    let result = input["result"].as_str();
+
+    let updated = kh
+        .task_update(task_id, status, title, description, assigned_to, result)
+        .await?;
+
+    match updated {
+        Some(task) => serde_json::to_string_pretty(&task).map_err(|e| format!("Serialize error: {e}")),
+        None => Ok(format!("Task not found: {task_id}")),
+    }
+}
+
+async fn tool_task_output(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let task_id = input["task_id"]
+        .as_str()
+        .ok_or("Missing 'task_id' parameter")?;
+
+    if kh.task_get(task_id).await?.is_none() {
+        return Ok(format!("Task not found: {task_id}"));
+    }
+
+    match kh.task_output(task_id).await? {
+        Some(output) if !output.trim().is_empty() => Ok(output),
+        _ => Ok(format!("Task {task_id} has no output yet.")),
+    }
+}
+
+async fn tool_task_stop(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let task_id = input["task_id"]
+        .as_str()
+        .ok_or("Missing 'task_id' parameter")?;
+    let reason = input["reason"].as_str();
+
+    kh.task_stop(task_id, reason).await?;
+    Ok(format!("Task {task_id} canceled."))
 }
 
 async fn tool_event_publish(
@@ -4349,6 +4779,9 @@ mod tests {
         assert!(names.contains(&"file_list"));
         assert!(names.contains(&"file_search"));
         assert!(names.contains(&"grep_search"));
+        assert!(names.contains(&"mcp_resource_list"));
+        assert!(names.contains(&"mcp_resource_read"));
+        assert!(names.contains(&"mcp_diagnostics"));
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"agent_send"));
         assert!(names.contains(&"agent_spawn"));
@@ -4356,12 +4789,18 @@ mod tests {
         assert!(names.contains(&"agent_kill"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
+        assert!(names.contains(&"memory_compact"));
         // 6 collaboration tools
         assert!(names.contains(&"agent_find"));
         assert!(names.contains(&"task_post"));
         assert!(names.contains(&"task_claim"));
         assert!(names.contains(&"task_complete"));
         assert!(names.contains(&"task_list"));
+        assert!(names.contains(&"task_create"));
+        assert!(names.contains(&"task_get"));
+        assert!(names.contains(&"task_update"));
+        assert!(names.contains(&"task_output"));
+        assert!(names.contains(&"task_stop"));
         assert!(names.contains(&"event_publish"));
         // 5 new Phase 3 tools
         assert!(names.contains(&"schedule_create"));
@@ -4413,6 +4852,11 @@ mod tests {
             "task_claim",
             "task_complete",
             "task_list",
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_output",
+            "task_stop",
             "event_publish",
         ];
         for name in &collab_tools {
@@ -4735,6 +5179,44 @@ mod tests {
             Err("not implemented".to_string())
         }
 
+        async fn compact_agent_session(&self, agent_id: &str) -> Result<String, String> {
+            Ok(format!("Compacted session for {agent_id}"))
+        }
+
+        async fn memory_consolidate(
+            &self,
+        ) -> Result<openfang_types::memory::ConsolidationReport, String> {
+            Ok(openfang_types::memory::ConsolidationReport {
+                memories_merged: 2,
+                memories_decayed: 5,
+                duration_ms: 12,
+            })
+        }
+
+        async fn context_report(
+            &self,
+            agent_id: &str,
+        ) -> Result<crate::compactor::ContextReport, String> {
+            let pressure = if agent_id.contains("high") {
+                crate::compactor::ContextPressure::High
+            } else {
+                crate::compactor::ContextPressure::Low
+            };
+            Ok(crate::compactor::ContextReport {
+                estimated_tokens: 140_000,
+                context_window: 200_000,
+                usage_percent: 70.0,
+                pressure,
+                message_count: 120,
+                breakdown: crate::compactor::ContextBreakdown {
+                    system_prompt_tokens: 2_000,
+                    message_tokens: 120_000,
+                    tool_definition_tokens: 18_000,
+                },
+                recommendation: "Use /compact for smarter summarization.".to_string(),
+            })
+        }
+
         async fn knowledge_add_entity(
             &self,
             _entity: openfang_types::memory::Entity,
@@ -4894,6 +5376,296 @@ mod tests {
         .await;
         assert!(!remove.is_error, "todo remove failed: {}", remove.content);
         assert!(remove.content.contains("Todo list is empty"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_compact_session_and_global_modes() {
+        let kernel: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernel {
+            memory: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        let session = execute_tool(
+            "test-id",
+            "memory_compact",
+            &serde_json::json!({"mode":"session"}),
+            Some(&kernel),
+            None,
+            Some("agent-compact"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!session.is_error, "session compact failed: {}", session.content);
+        assert!(session.content.contains("agent-compact"));
+
+        let global = execute_tool(
+            "test-id",
+            "memory_compact",
+            &serde_json::json!({"mode":"global"}),
+            Some(&kernel),
+            None,
+            Some("agent-compact"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!global.is_error, "global compact failed: {}", global.content);
+        assert!(global.content.contains("merged=2"));
+        assert!(global.content.contains("decayed=5"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_compact_invalid_mode_errors() {
+        let kernel: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernel {
+            memory: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        let invalid = execute_tool(
+            "test-id",
+            "memory_compact",
+            &serde_json::json!({"mode":"unknown"}),
+            Some(&kernel),
+            None,
+            Some("agent-compact"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(invalid.is_error);
+        assert!(invalid.content.contains("Invalid mode"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_compact_status_and_auto_modes() {
+        let kernel: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernel {
+            memory: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        let status = execute_tool(
+            "test-id",
+            "memory_compact",
+            &serde_json::json!({"mode":"status"}),
+            Some(&kernel),
+            None,
+            Some("agent-low"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!status.is_error, "status mode failed: {}", status.content);
+        assert!(status.content.contains("\"pressure\""));
+
+        let auto_skip = execute_tool(
+            "test-id",
+            "memory_compact",
+            &serde_json::json!({"mode":"auto"}),
+            Some(&kernel),
+            None,
+            Some("agent-low"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!auto_skip.is_error);
+        assert!(auto_skip.content.contains("Auto compaction skipped"));
+
+        let auto_trigger = execute_tool(
+            "test-id",
+            "memory_compact",
+            &serde_json::json!({"mode":"auto"}),
+            Some(&kernel),
+            None,
+            Some("agent-high"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!auto_trigger.is_error);
+        assert!(auto_trigger.content.contains("Auto compaction triggered"));
+    }
+
+    #[test]
+    fn test_format_permission_error_includes_code_and_remediation() {
+        let msg = format_permission_error(
+            "CAPABILITY_NOT_GRANTED",
+            "Permission denied: missing capability",
+            "capabilities.tools does not include 'shell_exec'",
+            "Grant capability in agent manifest",
+        );
+        assert!(msg.contains("PERMISSION_DENIED[CAPABILITY_NOT_GRANTED]"));
+        assert!(msg.contains("Policy:"));
+        assert!(msg.contains("Remediation:"));
+        assert!(msg.contains("Grant capability in agent manifest"));
+    }
+
+    #[test]
+    fn test_permission_reason_codes_have_policy_and_remediation_lines() {
+        let cases = [
+            "CAPABILITY_NOT_GRANTED",
+            "CODING_TOOLS_DISABLED",
+            "APPROVAL_DENIED_OR_TIMED_OUT",
+            "APPROVAL_SYSTEM_ERROR",
+        ];
+
+        for code in cases {
+            let msg = format_permission_error(
+                code,
+                "Permission denied message",
+                "policy inspection context",
+                "next action",
+            );
+            assert!(msg.contains(&format!("PERMISSION_DENIED[{code}]")));
+            assert!(msg.contains("Policy: policy inspection context"));
+            assert!(msg.contains("Remediation: next action"));
+        }
+    }
+
+    #[test]
+    fn test_format_mcp_call_error_includes_hint() {
+        let msg = format_mcp_call_error("MCP not available for tool: mcp_demo_ping");
+        assert!(msg.contains("MCP_HINT:"));
+    }
+
+    #[test]
+    fn test_classify_tool_failure_mcp_and_timeout() {
+        let (code, retry) = classify_tool_failure("MCP server 'x' not connected");
+        assert_eq!(code, "mcp_not_connected");
+        assert_eq!(retry, "retry_after_reconnect");
+
+        let (code, retry) = classify_tool_failure("request timed out after 30s");
+        assert_eq!(code, "timeout");
+        assert_eq!(retry, "retryable");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_diagnostics_when_unavailable() {
+        let result = execute_tool(
+            "test-id",
+            "mcp_diagnostics",
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("MCP_HINT:"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_resource_tools_missing_params() {
+        let list_missing_server = execute_tool(
+            "test-id",
+            "mcp_resource_list",
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(list_missing_server.is_error);
+        assert!(list_missing_server.content.contains("Missing 'server' parameter"));
+
+        let read_missing_uri = execute_tool(
+            "test-id",
+            "mcp_resource_read",
+            &serde_json::json!({"server":"demo"}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(read_missing_uri.is_error);
+        assert!(read_missing_uri.content.contains("Missing 'uri' parameter"));
     }
 
     #[test]
@@ -5451,6 +6223,7 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("disabled by exec_policy.enable_coding_tools=false"));
+        assert!(result.content.contains("Policy: exec_policy.enable_coding_tools = false"));
     }
 
     #[tokio::test]
@@ -5556,6 +6329,8 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(result.content.contains("Permission denied"));
+        assert!(result.content.contains("Policy:"));
+        assert!(result.content.contains("capabilities.tools does not include"));
     }
 
     #[tokio::test]

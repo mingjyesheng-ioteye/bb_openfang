@@ -9,7 +9,9 @@
 
 use http::{HeaderName, HeaderValue};
 use openfang_types::tool::ToolDefinition;
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ReadResourceRequestParams,
+};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde::{Deserialize, Serialize};
@@ -198,6 +200,62 @@ impl McpConnection {
             Ok(serde_json::to_string(&result).unwrap_or_default())
         } else {
             Ok(texts.join("\n"))
+        }
+    }
+
+    /// List MCP resources exposed by this server.
+    pub async fn list_resources(&self) -> Result<Vec<serde_json::Value>, String> {
+        let resources = self
+            .client
+            .list_all_resources()
+            .await
+            .map_err(|e| format!("MCP resources/list failed: {e}"))?;
+
+        let mut out = Vec::with_capacity(resources.len());
+        for resource in resources {
+            out.push(serde_json::to_value(resource).unwrap_or_else(|_| serde_json::json!({})));
+        }
+        Ok(out)
+    }
+
+    /// Read a single MCP resource by URI.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let result = self
+            .client
+            .read_resource(ReadResourceRequestParams::new(uri))
+            .await
+            .map_err(|e| format!("MCP resources/read failed: {e}"))?;
+
+        let mut rendered: Vec<String> = Vec::new();
+        for content in result.contents {
+            match content {
+                rmcp::model::ResourceContents::TextResourceContents {
+                    uri,
+                    mime_type,
+                    text,
+                    ..
+                } => rendered.push(format!(
+                    "uri={uri} mime={}\n{}",
+                    mime_type.unwrap_or_else(|| "text/plain".to_string()),
+                    text
+                )),
+                rmcp::model::ResourceContents::BlobResourceContents {
+                    uri,
+                    mime_type,
+                    blob,
+                    ..
+                } => rendered.push(format!(
+                    "uri={uri} mime={}\n[binary/blob length={} bytes]",
+                    mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                    blob.len()
+                )),
+            }
+        }
+
+        if rendered.is_empty() {
+            Ok("Resource read succeeded but returned no content.".to_string())
+        } else {
+            Ok(rendered.join("\n\n"))
         }
     }
 
@@ -393,6 +451,46 @@ pub fn normalize_name(name: &str) -> String {
     name.to_lowercase().replace('-', "_")
 }
 
+/// Return actionable diagnostics for MCP connection/setup failures.
+pub fn connection_hint(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("auth")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("token")
+    {
+        "Check MCP auth configuration (env vars/headers) and verify credentials are available at process start."
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "Increase mcp_servers.timeout_secs and verify network/server responsiveness."
+    } else if lower.contains("spawn") || lower.contains("command") || lower.contains("not found") {
+        "Verify transport.command path and args; on Windows prefer absolute paths for node/npx binaries."
+    } else if lower.contains("ssrf") || lower.contains("metadata endpoint") {
+        "Use an MCP endpoint that is not blocked by SSRF protections."
+    } else {
+        "Verify server transport config, credentials, and connectivity; then retry MCP reconnect."
+    }
+}
+
+/// Return actionable diagnostics for MCP per-call failures.
+pub fn call_hint(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("not connected") || lower.contains("not available") {
+        "Reconnect MCP servers and verify the server name in mcp_{server}_{tool}."
+    } else if lower.contains("invalid mcp tool name") {
+        "Use mcp_{server}_{tool} format and confirm server/tool names from connected MCP summary."
+    } else if lower.contains("resources/read") || lower.contains("resources/list") {
+        "Confirm the server advertises resources capability and the requested URI exists."
+    } else if lower.contains("auth")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("token")
+    {
+        "Check MCP server credentials (env/headers) and retry after reconnect."
+    } else {
+        "Retry once; if it persists, run MCP diagnostics and verify transport/auth configuration."
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +631,17 @@ mod tests {
             }
             _ => panic!("Expected Http transport"),
         }
+    }
+
+    #[test]
+    fn test_connection_hint_auth_and_spawn_paths() {
+        assert!(connection_hint("unauthorized token expired").contains("auth"));
+        assert!(connection_hint("Failed to spawn MCP server 'npx'").contains("command path"));
+    }
+
+    #[test]
+    fn test_call_hint_invalid_name_and_resource_paths() {
+        assert!(call_hint("Invalid MCP tool name: bad").contains("mcp_{server}_{tool}"));
+        assert!(call_hint("MCP resources/read failed").contains("resources capability"));
     }
 }

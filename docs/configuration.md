@@ -1149,6 +1149,32 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/docs"]
 ```
 
 ```toml
+# Windows stdio example (prefer absolute command path)
+[[mcp_servers]]
+name = "filesystem-win"
+timeout_secs = 45
+env = []
+
+[mcp_servers.transport]
+type = "stdio"
+command = "C:\\Program Files\\nodejs\\npx.cmd"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "C:/Users/you/Documents"]
+```
+
+```toml
+# macOS/Linux stdio example
+[[mcp_servers]]
+name = "filesystem-posix"
+timeout_secs = 45
+env = []
+
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/Documents"]
+```
+
+```toml
 [[mcp_servers]]
 name = "remote-api"
 timeout_secs = 60
@@ -1157,6 +1183,18 @@ env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 [mcp_servers.transport]
 type = "sse"
 url = "https://mcp.example.com/sse"
+```
+
+```toml
+[[mcp_servers]]
+name = "remote-http"
+timeout_secs = 60
+env = []
+headers = ["Authorization: Bearer ${MCP_TOKEN}"]
+
+[mcp_servers.transport]
+type = "http"
+url = "https://mcp.example.com/v1/mcp"
 ```
 
 | Field | Type | Default | Description |
@@ -1171,6 +1209,13 @@ url = "https://mcp.example.com/sse"
 |--------|--------|-------------|
 | `stdio` | `command` (string), `args` (list of strings, default `[]`) | Spawn a subprocess, communicate via JSON-RPC over stdin/stdout. |
 | `sse` | `url` (string) | Connect to an HTTP Server-Sent Events endpoint. |
+| `http` | `url` (string) | Connect via Streamable HTTP transport (`application/json` + `text/event-stream`). |
+
+MCP operability helpers exposed as tools:
+
+- `mcp_diagnostics`: show connected servers and quick remediation hints when MCP is unavailable.
+- `mcp_resource_list`: list resources from a specific connected MCP server (`server` required).
+- `mcp_resource_read`: read a resource URI from a specific connected MCP server (`server`, `uri` required).
 
 ---
 
@@ -1656,6 +1701,79 @@ Example calls:
   "input": {}
 }
 ```
+
+### Permission Denial Reason Codes
+
+When a tool call is blocked by policy, OpenFang returns a machine-readable prefix in the error text:
+
+- `PERMISSION_DENIED[CAPABILITY_NOT_GRANTED]`
+- `PERMISSION_DENIED[CODING_TOOLS_DISABLED]`
+- `PERMISSION_DENIED[APPROVAL_DENIED_OR_TIMED_OUT]`
+- `PERMISSION_DENIED[APPROVAL_SYSTEM_ERROR]`
+
+Each denied response also includes:
+
+- `Policy:` with the specific policy gate that blocked execution.
+- `Remediation:` with actionable next steps.
+
+### Memory Compaction Tool
+
+OpenFang exposes a manual memory compaction tool for long-running coding sessions:
+
+1. `memory_compact` with `mode = "session"` compacts the current agent session history using the kernel compaction pipeline.
+2. `memory_compact` with `mode = "global"` runs memory consolidation across memory stores and returns a consolidation report.
+3. `memory_compact` with `mode = "status"` returns context pressure and compaction recommendation for the current agent session.
+4. `memory_compact` with `mode = "auto"` triggers session compaction only when context pressure is `high` or `critical`.
+
+Example calls:
+
+```json
+{
+  "tool": "memory_compact",
+  "input": {
+    "mode": "session"
+  }
+}
+```
+
+```json
+{
+  "tool": "memory_compact",
+  "input": {
+    "mode": "global"
+  }
+}
+```
+
+```json
+{
+  "tool": "memory_compact",
+  "input": {
+    "mode": "status"
+  }
+}
+```
+
+```json
+{
+  "tool": "memory_compact",
+  "input": {
+    "mode": "auto"
+  }
+}
+```
+
+### Coding-loop SLO Telemetry
+
+OpenFang emits per-tool execution telemetry events (`tool_execution_slo`) with:
+
+- `tool`: canonical tool name
+- `elapsed_ms`: end-to-end tool execution latency
+- `outcome`: `ok` or `error`
+- `failure_code`: normalized taxonomy code for failures
+- `retry_class`: retry guidance class (`retryable`, `no_retry`, `retry_after_reconnect`, `retry_after_config`)
+
+For MCP failures, response payloads include `MCP_HINT:` remediation guidance to reduce repeated failure loops.
 
 ### Autonomous Guardrails (per-agent manifest)
 

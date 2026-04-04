@@ -281,6 +281,36 @@ pub fn format_context_report(report: &ContextReport) -> String {
     )
 }
 
+const SUMMARY_SECTIONS: [&str; 5] = [
+    "Key Facts",
+    "Key Decisions",
+    "Open TODOs",
+    "Open Blockers",
+    "Next Step",
+];
+
+fn has_required_summary_sections(summary: &str) -> bool {
+    let lower = summary.to_lowercase();
+    SUMMARY_SECTIONS
+        .iter()
+        .all(|s| lower.contains(&format!("{}:", s.to_lowercase())))
+}
+
+fn enforce_summary_structure(summary: &str) -> String {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return "Key Facts:\n- No summary content available.\n\nKey Decisions:\n- Not explicitly captured.\n\nOpen TODOs:\n- Not explicitly captured.\n\nOpen Blockers:\n- None explicitly captured.\n\nNext Step:\n- Continue from the most recent preserved messages.".to_string();
+    }
+
+    if has_required_summary_sections(trimmed) {
+        return trimmed.to_string();
+    }
+
+    format!(
+        "Key Facts:\n{trimmed}\n\nKey Decisions:\n- Not explicitly captured.\n\nOpen TODOs:\n- Not explicitly captured.\n\nOpen Blockers:\n- None explicitly captured.\n\nNext Step:\n- Continue from the most recent preserved messages."
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Adaptive Chunking
 // ---------------------------------------------------------------------------
@@ -444,8 +474,16 @@ async fn summarize_messages(
     }
 
     let summarize_prompt = format!(
-        "Summarize the following conversation preserving key facts, decisions, user preferences, \
-         and important context. Be concise but thorough. Output only the summary, no preamble.\n\n\
+           "Summarize the following conversation preserving key facts, user preferences, implementation \
+            context, and unresolved work.\n\n\
+            Format the summary using these sections exactly:\n\
+            1) Key Facts\n\
+            2) Key Decisions\n\
+            3) Open TODOs\n\
+            4) Open Blockers\n\
+            5) Next Step\n\n\
+            Keep it concise but do not drop unresolved TODOs/blockers or explicit decisions. \
+            Output only the summary, no preamble.\n\n\
          ---\n{conversation_text}---"
     );
 
@@ -462,8 +500,8 @@ async fn summarize_messages(
         max_tokens: config.max_summary_tokens,
         temperature: 0.3,
         system: Some(
-            "You are a conversation summarizer. Produce a concise summary that captures \
-             all key facts, decisions, and context from the conversation."
+            "You are a conversation summarizer for coding sessions. Preserve key facts, \
+             explicit decisions, unresolved TODOs, unresolved blockers, and the most actionable next step."
                 .to_string(),
         ),
         thinking: None,
@@ -480,7 +518,7 @@ async fn summarize_messages(
                     warn!(attempt, "Empty summary from LLM, retrying");
                     continue;
                 }
-                return Ok(summary);
+                return Ok(enforce_summary_structure(&summary));
             }
             Err(e) => {
                 last_error = format!("LLM summarization failed: {e}");
@@ -557,7 +595,14 @@ async fn summarize_in_chunks(
     // Merge summaries with another LLM call
     let merge_prompt = format!(
         "Merge these {} conversation summaries into one concise, coherent summary. \
-         Preserve all key facts, decisions, and context. Output only the merged summary.\n\n{}",
+         Preserve all key facts, decisions, unresolved TODOs, unresolved blockers, and a single \
+         most actionable next step. Keep the same section structure:\n\
+         1) Key Facts\n\
+         2) Key Decisions\n\
+         3) Open TODOs\n\
+         4) Open Blockers\n\
+         5) Next Step\n\n\
+         Output only the merged summary.\n\n{}",
         summaries.len(),
         summaries
             .iter()
@@ -580,8 +625,8 @@ async fn summarize_in_chunks(
         max_tokens: config.max_summary_tokens,
         temperature: 0.3,
         system: Some(
-            "You are a conversation summarizer. Merge the provided partial summaries \
-             into a single cohesive summary."
+            "You are a conversation summarizer for coding sessions. Merge the provided \
+             partial summaries into one cohesive summary while preserving decisions, TODOs, blockers, and next action."
                 .to_string(),
         ),
         thinking: None,
@@ -592,15 +637,15 @@ async fn summarize_in_chunks(
             let merged = response.text();
             if merged.is_empty() {
                 // Fall back to concatenating the per-chunk summaries
-                Ok(summaries.join("\n\n"))
+                Ok(enforce_summary_structure(&summaries.join("\n\n")))
             } else {
-                Ok(merged)
+                Ok(enforce_summary_structure(&merged))
             }
         }
         Err(e) => {
             warn!(error = %e, "Merge summarization failed, concatenating chunks");
             // Fallback: just concatenate the chunk summaries
-            Ok(summaries.join("\n\n"))
+            Ok(enforce_summary_structure(&summaries.join("\n\n")))
         }
     }
 }
@@ -756,7 +801,7 @@ pub async fn compact_session(
     );
 
     Ok(CompactionResult {
-        summary: minimal,
+        summary: enforce_summary_structure(&minimal),
         kept_messages,
         compacted_count,
         chunks_used: 0,
@@ -1209,6 +1254,226 @@ mod tests {
         assert!(!result.is_empty(), "Should produce a summary");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual benchmark harness"]
+    async fn benchmark_compaction_long_session_latency() {
+        use crate::llm_driver::{CompletionResponse, LlmError};
+        use async_trait::async_trait;
+        use std::time::Instant;
+
+        struct FakeDriver;
+
+        #[async_trait]
+        impl LlmDriver for FakeDriver {
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Key Facts:\n- benchmark\n\nKey Decisions:\n- keep compaction\n\nOpen TODOs:\n- none\n\nOpen Blockers:\n- none\n\nNext Step:\n- continue".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: openfang_types::message::StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 400,
+                        output_tokens: 120,
+                    },
+                })
+            }
+        }
+
+        let messages: Vec<Message> = (0..300)
+            .map(|i| Message::user(format!("Long-session message {i}: TODO check blocker and decision context.")))
+            .collect();
+
+        let session = Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id: openfang_types::agent::AgentId::new(),
+            messages,
+            context_window_tokens: 0,
+            label: None,
+        };
+
+        let config = CompactionConfig {
+            threshold: 30,
+            keep_recent: 12,
+            max_summary_tokens: 1200,
+            ..CompactionConfig::default()
+        };
+
+        let started = Instant::now();
+        let result = compact_session(Arc::new(FakeDriver), "test-model", &session, &config)
+            .await
+            .expect("compaction should succeed");
+        let elapsed_ms = started.elapsed().as_millis();
+
+        assert!(result.compacted_count > 0);
+        assert!(result.summary.contains("Key Facts:"));
+        eprintln!(
+            "benchmark_compaction_long_session_latency: compacted={} kept={} chunks={} elapsed={}ms",
+            result.compacted_count,
+            result.kept_messages.len(),
+            result.chunks_used,
+            elapsed_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn test_summarization_prompt_preserves_todos_blockers_and_decisions() {
+        use crate::llm_driver::{CompletionResponse, LlmError};
+        use async_trait::async_trait;
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingDriver {
+            req: Arc<Mutex<Option<CompletionRequest>>>,
+        }
+
+        #[async_trait]
+        impl LlmDriver for RecordingDriver {
+            async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                *self.req.lock().expect("lock") = Some(req);
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Summary".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: openfang_types::message::StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 10,
+                    },
+                })
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(None));
+        let driver = RecordingDriver {
+            req: Arc::clone(&recorded),
+        };
+
+        let messages = vec![
+            Message::user("TODO: add tests. Blocker: flaky CI."),
+            Message::assistant("Decision: keep SQLite for local runs."),
+        ];
+
+        let _ = summarize_messages(
+            Arc::new(driver),
+            "test-model",
+            &messages,
+            &CompactionConfig::default(),
+        )
+        .await
+        .expect("summarize_messages should succeed");
+
+        let req = recorded
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("request should be recorded");
+        let prompt = req
+            .messages
+            .first()
+            .and_then(|m| match &m.content {
+                MessageContent::Blocks(blocks) => blocks.first(),
+                _ => None,
+            })
+            .and_then(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+
+        assert!(prompt.contains("Key Decisions"));
+        assert!(prompt.contains("Open TODOs"));
+        assert!(prompt.contains("Open Blockers"));
+        assert!(
+            req.system.unwrap_or_default().contains("unresolved TODOs"),
+            "system prompt should reinforce unresolved TODO retention"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chunk_merge_prompt_preserves_todos_blockers_and_decisions() {
+        use crate::llm_driver::{CompletionResponse, LlmError};
+        use async_trait::async_trait;
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingDriver {
+            reqs: Arc<Mutex<Vec<CompletionRequest>>>,
+        }
+
+        #[async_trait]
+        impl LlmDriver for RecordingDriver {
+            async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                let mut guard = self.reqs.lock().expect("lock");
+                let idx = guard.len();
+                guard.push(req);
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: format!("summary-{idx}"),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: openfang_types::message::StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
+                })
+            }
+        }
+
+        let reqs = Arc::new(Mutex::new(Vec::new()));
+        let driver = RecordingDriver {
+            reqs: Arc::clone(&reqs),
+        };
+
+        let messages: Vec<Message> = (0..20)
+            .map(|i| Message::user(format!("TODO {i}: keep this; blocker {i}; decision {i}")))
+            .collect();
+
+        let _summary = summarize_in_chunks(
+            Arc::new(driver),
+            "test-model",
+            &messages,
+            &CompactionConfig::default(),
+        )
+        .await
+        .expect("chunked summary should succeed");
+
+        let captured = reqs.lock().expect("lock").clone();
+        assert!(captured.len() >= 2, "expected chunk + merge calls");
+
+        let merge_req = captured.last().expect("merge request exists");
+        let merge_prompt = merge_req
+            .messages
+            .first()
+            .and_then(|m| match &m.content {
+                MessageContent::Blocks(blocks) => blocks.first(),
+                _ => None,
+            })
+            .and_then(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+
+        assert!(merge_prompt.contains("Key Decisions"));
+        assert!(merge_prompt.contains("Open TODOs"));
+        assert!(merge_prompt.contains("Open Blockers"));
+        assert!(
+            merge_req
+                .system
+                .clone()
+                .unwrap_or_default()
+                .contains("TODOs, blockers"),
+            "merge system prompt should reinforce TODO/blocker retention"
+        );
+    }
+
     #[test]
     fn test_compaction_result_new_fields() {
         let result = CompactionResult {
@@ -1230,6 +1495,26 @@ mod tests {
         };
         assert_eq!(fallback_result.chunks_used, 0);
         assert!(fallback_result.used_fallback);
+    }
+
+    #[test]
+    fn test_enforce_summary_structure_adds_missing_sections() {
+        let raw = "Decision: keep sqlite. TODO: add tests. Blocker: flaky CI.";
+        let normalized = enforce_summary_structure(raw);
+
+        assert!(normalized.contains("Key Facts:"));
+        assert!(normalized.contains("Key Decisions:"));
+        assert!(normalized.contains("Open TODOs:"));
+        assert!(normalized.contains("Open Blockers:"));
+        assert!(normalized.contains("Next Step:"));
+        assert!(normalized.contains("flaky CI"));
+    }
+
+    #[test]
+    fn test_enforce_summary_structure_keeps_structured_input() {
+        let structured = "Key Facts:\n- A\n\nKey Decisions:\n- B\n\nOpen TODOs:\n- C\n\nOpen Blockers:\n- D\n\nNext Step:\n- E";
+        let normalized = enforce_summary_structure(structured);
+        assert_eq!(normalized, structured);
     }
 
     #[test]

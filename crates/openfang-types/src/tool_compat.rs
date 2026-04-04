@@ -26,9 +26,18 @@ pub fn map_tool_name(openclaw_name: &str) -> Option<&'static str> {
         "browser_navigate" => Some("browser_navigate"),
         "memory_search" | "memory_recall" => Some("memory_recall"),
         "memory_save" | "memory_store" => Some("memory_store"),
+        "memory_compact" | "MemoryCompact" => Some("memory_compact"),
+        "mcp_resource_list" | "McpResourceList" => Some("mcp_resource_list"),
+        "mcp_resource_read" | "McpResourceRead" => Some("mcp_resource_read"),
+        "mcp_diagnostics" | "McpDiagnostics" => Some("mcp_diagnostics"),
         "sessions_send" | "agent_message" => Some("agent_send"),
         "sessions_list" | "agents_list" | "agent_list" => Some("agent_list"),
         "sessions_spawn" => Some("agent_send"),
+        "task_create" | "TaskCreate" => Some("task_create"),
+        "task_get" | "TaskGet" => Some("task_get"),
+        "task_update" | "TaskUpdate" => Some("task_update"),
+        "task_output" | "TaskOutput" => Some("task_output"),
+        "task_stop" | "TaskStop" => Some("task_stop"),
 
         // LLM-hallucinated aliases (fs-* style names)
         "fs-read" | "fs_read" | "fsRead" | "readFile" => Some("file_read"),
@@ -76,6 +85,10 @@ pub fn is_known_openfang_tool(name: &str) -> bool {
             | "browser_navigate"
             | "memory_recall"
             | "memory_store"
+            | "memory_compact"
+            | "mcp_resource_list"
+            | "mcp_resource_read"
+            | "mcp_diagnostics"
             | "agent_send"
             | "agent_list"
             | "agent_spawn"
@@ -85,6 +98,11 @@ pub fn is_known_openfang_tool(name: &str) -> bool {
             | "task_claim"
             | "task_complete"
             | "task_list"
+            | "task_create"
+            | "task_get"
+            | "task_update"
+            | "task_output"
+            | "task_stop"
             | "event_publish"
             | "schedule_create"
             | "schedule_list"
@@ -143,12 +161,21 @@ mod tests {
         assert_eq!(map_tool_name("memory_recall"), Some("memory_recall"));
         assert_eq!(map_tool_name("memory_save"), Some("memory_store"));
         assert_eq!(map_tool_name("memory_store"), Some("memory_store"));
+        assert_eq!(map_tool_name("memory_compact"), Some("memory_compact"));
+        assert_eq!(map_tool_name("mcp_resource_list"), Some("mcp_resource_list"));
+        assert_eq!(map_tool_name("mcp_resource_read"), Some("mcp_resource_read"));
+        assert_eq!(map_tool_name("mcp_diagnostics"), Some("mcp_diagnostics"));
         assert_eq!(map_tool_name("sessions_send"), Some("agent_send"));
         assert_eq!(map_tool_name("agent_message"), Some("agent_send"));
         assert_eq!(map_tool_name("sessions_list"), Some("agent_list"));
         assert_eq!(map_tool_name("agents_list"), Some("agent_list"));
         assert_eq!(map_tool_name("agent_list"), Some("agent_list"));
         assert_eq!(map_tool_name("sessions_spawn"), Some("agent_send"));
+        assert_eq!(map_tool_name("task_create"), Some("task_create"));
+        assert_eq!(map_tool_name("task_get"), Some("task_get"));
+        assert_eq!(map_tool_name("task_update"), Some("task_update"));
+        assert_eq!(map_tool_name("task_output"), Some("task_output"));
+        assert_eq!(map_tool_name("task_stop"), Some("task_stop"));
 
         // LLM-hallucinated fs-* aliases
         assert_eq!(map_tool_name("fs-read"), Some("file_read"));
@@ -198,6 +225,15 @@ mod tests {
         assert_eq!(normalize_tool_name("fs-exec"), "shell_exec");
         assert_eq!(normalize_tool_name("Read"), "file_read");
         assert_eq!(normalize_tool_name("Bash"), "shell_exec");
+        assert_eq!(normalize_tool_name("MemoryCompact"), "memory_compact");
+        assert_eq!(normalize_tool_name("TaskCreate"), "task_create");
+        assert_eq!(normalize_tool_name("TaskGet"), "task_get");
+        assert_eq!(normalize_tool_name("TaskUpdate"), "task_update");
+        assert_eq!(normalize_tool_name("TaskOutput"), "task_output");
+        assert_eq!(normalize_tool_name("TaskStop"), "task_stop");
+        assert_eq!(normalize_tool_name("McpResourceList"), "mcp_resource_list");
+        assert_eq!(normalize_tool_name("McpResourceRead"), "mcp_resource_read");
+        assert_eq!(normalize_tool_name("McpDiagnostics"), "mcp_diagnostics");
 
         // Unknown names pass through unchanged
         assert_eq!(normalize_tool_name("my_custom_tool"), "my_custom_tool");
@@ -223,6 +259,10 @@ mod tests {
             "browser_navigate",
             "memory_recall",
             "memory_store",
+            "memory_compact",
+            "mcp_resource_list",
+            "mcp_resource_read",
+            "mcp_diagnostics",
             "agent_send",
             "agent_list",
             "agent_spawn",
@@ -232,6 +272,11 @@ mod tests {
             "task_claim",
             "task_complete",
             "task_list",
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_output",
+            "task_stop",
             "event_publish",
             "schedule_create",
             "schedule_list",

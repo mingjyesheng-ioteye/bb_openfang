@@ -291,3 +291,139 @@ Targets after Wave 2:
 - +30% first-pass patch success
 - -25% median coding-task latency
 - >=80% code exploration tasks resolved without shell fallback
+
+## 9) Spec-Informed Gap Analysis (claurst/spec -> bb_openfang)
+
+Reference baseline reviewed:
+- `claurst/spec/03_tools.md`
+- `claurst/spec/06_services_context_state.md`
+- `claurst/spec/11_special_systems.md`
+
+Current status note:
+- Waves 1-3 are implemented in this repo, but the coder-agent roadmap can still be improved for operational quality and advanced workflows.
+
+### Key Gaps and Priority
+
+1. Task lifecycle depth (High)
+- Gap: Current plan centers on `todo_write` checklisting, but lacks first-class task lifecycle APIs (`task_create`, `task_get`, `task_update`, `task_list`, `task_output`) for multi-step orchestration.
+- Impact: Harder to coordinate long-running coding work, subagent output capture, and resumable flows.
+
+2. Session memory lifecycle and compaction (High)
+- Gap: No explicit coding-loop plan for memory compaction/summarization triggers and transcript budget recovery.
+- Impact: Long sessions risk context bloat and lower-quality turns.
+
+3. Permission ergonomics and policy explainability (High)
+- Gap: Plan has safety controls but limited emphasis on user-facing deny/ask rationale consistency and policy introspection.
+- Impact: Friction when tools are blocked; slower user trust calibration.
+
+4. MCP resource ergonomics beyond tool invocation (Medium)
+- Gap: `code_symbol_refs` MCP path exists, but roadmap does not explicitly cover MCP resource list/read and auth/diagnostics UX.
+- Impact: Reduced discoverability and slower debugging of MCP-backed workflows.
+
+5. Reliability telemetry for coding loops (Medium)
+- Gap: Metrics are defined at dashboard level, but no explicit implementation track for per-tool error taxonomy and retry quality analytics.
+- Impact: Harder to diagnose regressions and prove rollout quality.
+
+6. Multi-agent orchestration maturity (Medium)
+- Gap: Parallel read-only batching exists, but no explicit plan for structured parent/subagent task contracts and output aggregation.
+- Impact: Limited scalability on large refactor/research tasks.
+
+7. Long-running automation hooks (Low/Medium)
+- Gap: No roadmap item for scheduled coding checks (cron-like periodic tasks) in local/dev workflows.
+- Impact: Missed opportunity for continuous repo health automation.
+
+## 10) Wave 4 (Coder Agent Quality+)
+
+Goal: Upgrade coder-agent robustness and usability beyond core tooling by adding orchestration, memory hygiene, permission clarity, and MCP operability.
+
+### EPIC J: Task Lifecycle V2
+Deliverables:
+- Add task APIs for create/get/update/list/output and task stop semantics
+- Persist task state with clear ownership (`agent_id`, parent task, timestamps)
+- Support resumable task execution after turn boundaries
+
+Acceptance criteria:
+- Complex coding jobs can be paused/resumed with no manual reconstruction
+- Subagent outputs are queryable and auditable
+
+### EPIC K: Session Memory + Context Compaction
+Deliverables:
+- Add compaction policy for long coding sessions (threshold-based + manual trigger)
+- Add summary artifacts that preserve unresolved TODOs/open blockers
+- Add post-compaction validation that critical constraints survive
+
+Acceptance criteria:
+- Measurable reduction in context size growth on long sessions
+- No increase in unresolved-task loss after compaction
+
+### EPIC L: Permission UX and Explainability
+Deliverables:
+- Standardize deny/ask reason schema across mutating and shell tools
+- Add policy introspection tool output (what rule blocked/allowed this call)
+- Add actionable remediation guidance in rejection payloads
+
+Acceptance criteria:
+- Users can identify and fix blocked-tool causes in one iteration
+- Reduced repeated-denial loops in coding sessions
+
+### EPIC M: MCP Operability Expansion
+Deliverables:
+- Add MCP resource list/read helpers in coding flows
+- Add MCP auth/handshake diagnostics and startup health checks
+- Add deterministic fallback chain docs for MCP outage scenarios
+
+Acceptance criteria:
+- MCP-backed coding tools are self-diagnosable without shell debugging
+- Reduced time-to-resolution for MCP config issues
+
+### EPIC N: Reliability and Benchmark Hardening
+Deliverables:
+- Add per-tool error codes and retry classification
+- Record coding-loop SLOs (tool latency, fail rate, recovery success)
+- Add benchmark scenarios for multi-agent and long-session compaction cases
+
+Acceptance criteria:
+- Regressions can be localized to tool/policy layer quickly
+- Rollout decisions are data-backed at canary and default stages
+
+## 11) Wave 4 Task Board (Actionable)
+
+Status legend: TODO | IN_PROGRESS | BLOCKED | DONE
+
+### Track J: Task Lifecycle V2
+- [DONE] J1. Define task domain model and storage keys in runtime/kernel
+- [DONE] J2. Implement `task_create`, `task_get`, `task_update`, `task_list`, `task_output`, `task_stop`
+- [DONE] J3. Add schema/compat aliases and tool classification updates
+- [DONE] J4. Add integration tests for resume and parent/subagent aggregation
+
+### Track K: Memory + Compaction
+- [DONE] K1. Add context-budget monitors and compaction trigger strategy
+- [DONE] K2. Implement compaction summaries preserving TODOs/blockers/decisions
+- [DONE] K3. Add manual compaction command/tool entrypoint
+- [DONE] K4. Add regression tests for information retention post-compaction
+
+### Track L: Permission Explainability
+- [DONE] L1. Normalize permission decision payloads with machine-readable reason codes
+- [DONE] L2. Add policy-inspection helper output for blocked tool calls
+- [DONE] L3. Add docs for common deny paths and fast remediation
+- [DONE] L4. Add tests ensuring consistent rejection messaging across tool classes
+
+### Track M: MCP Operability
+- [DONE] M1. Add MCP resource list/read tool adapters (where available)
+- [DONE] M2. Add MCP connectivity/auth diagnostics at startup and per-call fallback hints
+- [DONE] M3. Add deterministic tests for missing MCP tool/resource/auth paths
+- [DONE] M4. Update configuration docs with validated Windows/macOS/Linux examples
+
+### Track N: Reliability and Benchmarks
+- [DONE] N1. Define coding-loop SLO metrics and emission points
+- [DONE] N2. Add per-tool failure taxonomy and retry reason attribution
+- [DONE] N3. Expand benchmark harness to include long-session compaction scenarios
+- [DONE] N4. Add canary scorecard template for Wave 4 promotion decisions
+
+## 12) Updated Success Targets (Post Wave 4)
+
+- +45% first-pass patch success vs. pre-Wave-1 baseline
+- -35% median coding-task latency on search/edit/test loops
+- >=90% code exploration tasks resolved without shell fallback
+- <3% repeated permission-denial loop rate per 100 coding turns
+- <2% MCP-related hard-failure rate after fallback paths

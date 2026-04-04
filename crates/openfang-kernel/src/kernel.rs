@@ -5213,13 +5213,17 @@ impl OpenFangKernel {
                     self.mcp_connections.lock().await.push(conn);
                 }
                 Err(e) => {
+                    let hint = openfang_runtime::mcp::connection_hint(&e);
                     warn!(
                         server = %server_config.name,
                         error = %e,
+                        hint,
                         "Failed to connect to MCP server"
                     );
-                    self.extension_health
-                        .report_error(&server_config.name, e.to_string());
+                    self.extension_health.report_error(
+                        &server_config.name,
+                        format!("{e} | hint: {hint}"),
+                    );
                 }
             }
         }
@@ -5324,11 +5328,15 @@ impl OpenFangKernel {
                     connected_count += 1;
                 }
                 Err(e) => {
-                    self.extension_health
-                        .report_error(&server_config.name, e.to_string());
+                    let hint = openfang_runtime::mcp::connection_hint(&e);
+                    self.extension_health.report_error(
+                        &server_config.name,
+                        format!("{e} | hint: {hint}"),
+                    );
                     warn!(
                         server = %server_config.name,
                         error = %e,
+                        hint,
                         "Failed to connect extension MCP server"
                     );
                 }
@@ -5441,8 +5449,10 @@ impl OpenFangKernel {
                 Ok(tool_count)
             }
             Err(e) => {
-                self.extension_health.report_error(id, e.to_string());
-                Err(format!("Reconnect failed for '{id}': {e}"))
+                let hint = openfang_runtime::mcp::connection_hint(&e);
+                self.extension_health
+                    .report_error(id, format!("{e} | hint: {hint}"));
+                Err(format!("Reconnect failed for '{id}': {e}. Hint: {hint}"))
             }
         }
     }
@@ -6633,6 +6643,65 @@ impl KernelHandle for OpenFangKernel {
             .map_err(|e| format!("Task list failed: {e}"))
     }
 
+    async fn task_get(&self, task_id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.memory
+            .task_get(task_id)
+            .await
+            .map_err(|e| format!("Task get failed: {e}"))
+    }
+
+    async fn task_update(
+        &self,
+        task_id: &str,
+        status: Option<&str>,
+        title: Option<&str>,
+        description: Option<&str>,
+        assigned_to: Option<&str>,
+        result: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.memory
+            .task_update(task_id, status, title, description, assigned_to, result)
+            .await
+            .map_err(|e| format!("Task update failed: {e}"))
+    }
+
+    async fn task_output(&self, task_id: &str) -> Result<Option<String>, String> {
+        let task = self
+            .memory
+            .task_get(task_id)
+            .await
+            .map_err(|e| format!("Task output lookup failed: {e}"))?;
+        Ok(task.and_then(|t| {
+            let raw = t.get("result").and_then(|v| v.as_str())?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }))
+    }
+
+    async fn task_stop(&self, task_id: &str, reason: Option<&str>) -> Result<(), String> {
+        let reason_text = reason.unwrap_or("Stopped by user");
+        let updated = self
+            .memory
+            .task_update(
+                task_id,
+                Some("canceled"),
+                None,
+                None,
+                None,
+                Some(reason_text),
+            )
+            .await
+            .map_err(|e| format!("Task stop failed: {e}"))?;
+        if updated.is_none() {
+            return Err(format!("Task not found: {task_id}"));
+        }
+        Ok(())
+    }
+
     async fn publish_event(
         &self,
         event_type: &str,
@@ -6649,6 +6718,32 @@ impl KernelHandle for OpenFangKernel {
         );
         OpenFangKernel::publish_event(self, event).await;
         Ok(())
+    }
+
+    async fn compact_agent_session(&self, agent_id: &str) -> Result<String, String> {
+        let aid: openfang_types::agent::AgentId = agent_id
+            .parse()
+            .map_err(|e| format!("Invalid agent_id: {e}"))?;
+        OpenFangKernel::compact_agent_session(self, aid)
+            .await
+            .map_err(|e| format!("Session compaction failed: {e}"))
+    }
+
+    async fn memory_consolidate(&self) -> Result<openfang_types::memory::ConsolidationReport, String> {
+        self.memory
+            .consolidate()
+            .await
+            .map_err(|e| format!("Memory consolidation failed: {e}"))
+    }
+
+    async fn context_report(
+        &self,
+        agent_id: &str,
+    ) -> Result<openfang_runtime::compactor::ContextReport, String> {
+        let aid: openfang_types::agent::AgentId = agent_id
+            .parse()
+            .map_err(|e| format!("Invalid agent_id: {e}"))?;
+        OpenFangKernel::context_report(self, aid).map_err(|e| format!("Context report failed: {e}"))
     }
 
     async fn knowledge_add_entity(
