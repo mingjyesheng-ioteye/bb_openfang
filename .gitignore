@@ -35,6 +35,7 @@ BUILD_LOG.md
 # Agent session logs (runtime data, not source)
 sessions/
 memory/
+AGENT.json
 
 # OS
 .DS_Store
