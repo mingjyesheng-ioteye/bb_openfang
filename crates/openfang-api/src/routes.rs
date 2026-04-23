@@ -11738,6 +11738,17 @@ pub async fn copilot_oauth_poll(
             // Set in current process
             std::env::set_var("GITHUB_TOKEN", access_token.as_str());
 
+            // Save .copilot-tokens.json so CopilotDriver can load it on next request.
+            // GitHub device flow tokens are long-lived (no expiry/refresh needed).
+            let persisted = openfang_runtime::drivers::copilot::PersistedTokens {
+                access_token: access_token.to_string(),
+                access_token_expires_at: i64::MAX / 2, // effectively no expiry
+                refresh_token: String::new(),
+            };
+            if let Err(e) = persisted.save(&state.kernel.config.home_dir) {
+                tracing::warn!("Failed to save .copilot-tokens.json: {e}");
+            }
+
             // Refresh auth detection
             state
                 .kernel
