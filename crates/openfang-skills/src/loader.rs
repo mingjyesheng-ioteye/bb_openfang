@@ -258,14 +258,22 @@ async fn execute_node(
 /// Find Python 3 binary.
 fn find_python() -> Option<String> {
     for name in &["python3", "python"] {
-        if std::process::Command::new(name)
+        // Must verify output contains "Python 3" to avoid the Windows Store shim
+        // (python3.exe that exits 0 but prints a Store install prompt to stderr).
+        if let Ok(output) = std::process::Command::new(name)
             .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .output()
         {
-            return Some(name.to_string());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.success()
+                && (stdout.contains("Python 3") || stderr.contains("Python 3"))
+            {
+                return Some(name.to_string());
+            }
         }
     }
     None
