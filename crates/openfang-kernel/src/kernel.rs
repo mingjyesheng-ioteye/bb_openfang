@@ -5682,6 +5682,20 @@ impl OpenFangKernel {
             all_tools.retain(|t| t.name != "shell_exec");
         }
 
+        // Cap at 128 tools (OpenAI/Copilot API hard limit).
+        // Keep builtin tools (first) and trim excess skill/MCP tools.
+        const MAX_TOOLS: usize = 128;
+        if all_tools.len() > MAX_TOOLS {
+            warn!(
+                agent_id = %agent_id,
+                total = all_tools.len(),
+                max = MAX_TOOLS,
+                "Too many tools — truncating to {MAX_TOOLS}. \
+                 Consider assigning specific skills to this agent.",
+            );
+            all_tools.truncate(MAX_TOOLS);
+        }
+
         all_tools
     }
 
