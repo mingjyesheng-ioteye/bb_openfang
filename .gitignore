@@ -32,6 +32,10 @@ predictions_database.json
 prediction_report_*.md
 BUILD_LOG.md
 
+# Agent session logs (runtime data, not source)
+sessions/
+memory/
+
 # OS
 .DS_Store
 ._*
