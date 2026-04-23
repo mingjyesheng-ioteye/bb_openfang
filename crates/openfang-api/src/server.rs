@@ -604,6 +604,10 @@ pub async fn build_router(
             "/api/providers/github-copilot/oauth/poll/{poll_id}",
             axum::routing::get(routes::copilot_oauth_poll),
         )
+        .route(
+            "/api/providers/github-copilot/oauth/status",
+            axum::routing::get(routes::copilot_oauth_status),
+        )
         // Codex OAuth PKCE (must be before parametric {name} routes)
         .route(
             "/api/providers/openai-codex/oauth/start",

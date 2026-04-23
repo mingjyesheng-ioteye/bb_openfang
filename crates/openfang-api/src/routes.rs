@@ -11639,6 +11639,7 @@ fn validate_webhook_token(headers: &axum::http::HeaderMap, token_env: &str) -> b
 /// State for an in-progress device flow.
 struct CopilotFlowState {
     device_code: String,
+    #[allow(dead_code)]
     interval: u64,
     expires_at: Instant,
 }
@@ -11689,7 +11690,7 @@ pub async fn copilot_oauth_start() -> impl IntoResponse {
 ///
 /// Poll the status of a GitHub device flow.
 /// Returns `pending`, `complete`, `expired`, `denied`, or `error`.
-/// On `complete`, saves the token to secrets.env and sets GITHUB_TOKEN.
+/// On `complete`, saves the token and sets GITHUB_TOKEN.
 pub async fn copilot_oauth_poll(
     State(state): State<Arc<AppState>>,
     Path(poll_id): Path<String>,
@@ -11730,9 +11731,7 @@ pub async fn copilot_oauth_poll(
             if let Err(e) = write_secret_env(&secrets_path, "GITHUB_TOKEN", &access_token) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::json!({"status": "error", "error": format!("Failed to save token: {e}")}),
-                    ),
+                    Json(serde_json::json!({"status": "error", "error": format!("Failed to save token: {e}")})),
                 );
             }
 
@@ -11755,16 +11754,10 @@ pub async fn copilot_oauth_poll(
                 Json(serde_json::json!({"status": "complete"})),
             )
         }
-        openfang_runtime::copilot_oauth::DeviceFlowStatus::SlowDown { new_interval } => {
-            // Update interval
-            if let Some(mut f) = COPILOT_FLOWS.get_mut(&poll_id) {
-                f.interval = new_interval;
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "pending", "interval": new_interval})),
-            )
-        }
+        openfang_runtime::copilot_oauth::DeviceFlowStatus::SlowDown { new_interval: _ } => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "pending"})),
+        ),
         openfang_runtime::copilot_oauth::DeviceFlowStatus::Expired => {
             COPILOT_FLOWS.remove(&poll_id);
             (
@@ -11787,10 +11780,24 @@ pub async fn copilot_oauth_poll(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// OpenAI Codex OAuth PKCE Flow
+// GitHub Copilot OAuth status
 // ══════════════════════════════════════════════════════════════════════
 
-/// State for an in-progress Codex PKCE flow.
+/// GET /api/providers/github-copilot/oauth/status
+///
+/// Returns whether GitHub Copilot OAuth tokens are present on disk.
+pub async fn copilot_oauth_status() -> impl IntoResponse {
+    let openfang_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(|h| std::path::PathBuf::from(h).join(".openfang"))
+        .unwrap_or_else(|_| std::path::PathBuf::from(".openfang"));
+    let authenticated = openfang_runtime::drivers::copilot::copilot_auth_available(&openfang_dir);
+    Json(serde_json::json!({ "authenticated": authenticated }))
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OpenAI Codex OAuth PKCE Flow
+// ══════════════════════════════════════════════════════════════════════
 struct CodexFlowState {
     /// Authorization URL the user should open in their browser.
     auth_url: String,
