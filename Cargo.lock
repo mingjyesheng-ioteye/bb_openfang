@@ -4162,7 +4162,7 @@ dependencies = [
  "openfang-wire",
  "rand 0.8.5",
  "reqwest 0.12.28",
- "rustls 0.23.37",
+ "rustls",
  "serde",
  "serde_json",
  "subtle",
@@ -8984,7 +8984,6 @@ dependencies = [
 [[package]]
 name = "winnow"
 version = "0.7.15"
-<<<<<<< HEAD
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
@@ -8994,8 +8993,6 @@ dependencies = [
 [[package]]
 name = "winnow"
 version = "1.0.0"
-=======
->>>>>>> d498a95 (fix: fall back to default LLM driver when Copilot not authenticated)
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a90e88e4667264a994d34e6d1ab2d26d398dcdca8b7f52bec8668957517fc7d8"
 dependencies = [

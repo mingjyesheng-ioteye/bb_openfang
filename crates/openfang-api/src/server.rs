@@ -600,27 +600,6 @@ pub async fn build_router(
             "/api/providers/github-copilot/oauth/status",
             axum::routing::get(routes::copilot_oauth_status),
         )
-        // Codex OAuth PKCE (must be before parametric {name} routes)
-        .route(
-            "/api/providers/openai-codex/oauth/start",
-            axum::routing::post(routes::codex_oauth_start),
-        )
-        .route(
-            "/api/providers/openai-codex/oauth/callback",
-            axum::routing::get(routes::codex_oauth_callback),
-        )
-        .route(
-            "/api/providers/openai-codex/oauth/poll/{poll_id}",
-            axum::routing::get(routes::codex_oauth_poll),
-        )
-        .route(
-            "/api/providers/openai-codex/oauth/status",
-            axum::routing::get(routes::codex_oauth_status),
-        )
-        .route(
-            "/api/providers/openai-codex/oauth/logout",
-            axum::routing::post(routes::codex_oauth_logout),
-        )
         .route(
             "/api/providers/{name}/key",
             axum::routing::post(routes::set_provider_key).delete(routes::delete_provider_key),
