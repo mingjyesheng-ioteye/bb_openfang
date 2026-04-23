@@ -5034,7 +5034,14 @@ impl OpenFangKernel {
                     // provider), fall back to the boot-time default driver. This
                     // keeps existing agents working while the user is still
                     // configuring providers via the dashboard.
-                    if agent_provider == default_provider && !has_custom_key && !has_custom_url {
+                    //
+                    // Also fall back gracefully for MissingApiKey errors (e.g. Copilot
+                    // not yet authenticated) so the agent boots and users can connect
+                    // their provider via the dashboard instead of getting a hard crash.
+                    let is_missing_key = matches!(e, LlmError::MissingApiKey(_));
+                    if (agent_provider == default_provider && !has_custom_key && !has_custom_url)
+                        || is_missing_key
+                    {
                         debug!(
                             provider = %agent_provider,
                             error = %e,
