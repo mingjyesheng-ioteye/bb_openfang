@@ -25,6 +25,7 @@
 
 use crate::host_functions;
 use crate::kernel_handle::KernelHandle;
+use anyhow::{bail, format_err};
 use openfang_types::capability::Capability;
 use std::sync::Arc;
 use tracing::debug;
