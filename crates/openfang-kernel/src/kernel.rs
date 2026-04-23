@@ -4154,7 +4154,7 @@ impl OpenFangKernel {
             });
         }
 
-        // Probe local providers for reachability and model discovery
+        // Probe local providers for reachability and model discovery (parallel)
         {
             let kernel = Arc::clone(self);
             tokio::spawn(async move {
@@ -4171,10 +4171,27 @@ impl OpenFangKernel {
                         .collect()
                 };
 
-                for (provider_id, base_url) in &local_providers {
-                    let result =
-                        openfang_runtime::provider_health::probe_provider(provider_id, base_url)
+                // Probe all providers concurrently instead of sequentially so that
+                // unreachable providers don't block each other (each has a 2s timeout).
+                let probe_futures: Vec<_> = local_providers
+                    .iter()
+                    .map(|(provider_id, base_url)| {
+                        let provider_id = provider_id.clone();
+                        let base_url = base_url.clone();
+                        async move {
+                            let result = openfang_runtime::provider_health::probe_provider(
+                                &provider_id,
+                                &base_url,
+                            )
                             .await;
+                            (provider_id, result)
+                        }
+                    })
+                    .collect();
+
+                let results = futures::future::join_all(probe_futures).await;
+
+                for (provider_id, result) in results {
                     if result.reachable {
                         info!(
                             provider = %provider_id,
@@ -4185,7 +4202,7 @@ impl OpenFangKernel {
                         if !result.discovered_models.is_empty() {
                             if let Ok(mut catalog) = kernel.model_catalog.write() {
                                 catalog.merge_discovered_models(
-                                    provider_id,
+                                    &provider_id,
                                     &result.discovered_models,
                                 );
                             }
