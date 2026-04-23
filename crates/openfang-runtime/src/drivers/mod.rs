@@ -564,6 +564,14 @@ pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'stat
     {
         return Some(("gemini", "gemini-2.5-flash", "GOOGLE_API_KEY"));
     }
+    // Check GitHub Copilot token on disk (no env var needed — auth is file-based)
+    let openfang_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(|h| std::path::PathBuf::from(h).join(".openfang"))
+        .unwrap_or_else(|_| std::path::PathBuf::from(".openfang"));
+    if copilot::copilot_auth_available(&openfang_dir) {
+        return Some(("github-copilot", "github-copilot/claude-sonnet-4-5", ""));
+    }
     None
 }
 
