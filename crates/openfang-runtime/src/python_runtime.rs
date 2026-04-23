@@ -96,16 +96,22 @@ pub fn validate_script_path(path: &str) -> Result<(), PythonError> {
 
 /// Find the Python interpreter on this system.
 fn find_python_interpreter() -> String {
-    // Try python3 first, then python
+    // Try python3 first, then python.
+    // Must verify output contains "Python 3" to avoid the Windows Store shim
+    // (python3.exe that exits 0 but prints a Store install prompt to stderr).
     for cmd in &["python3", "python"] {
-        if std::process::Command::new(cmd)
+        if let Ok(output) = std::process::Command::new(cmd)
             .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .output()
         {
-            return cmd.to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if (stdout.contains("Python 3") || stderr.contains("Python 3")) && output.status.success() {
+                return cmd.to_string();
+            }
         }
     }
     "python3".to_string() // default, will fail with helpful message
