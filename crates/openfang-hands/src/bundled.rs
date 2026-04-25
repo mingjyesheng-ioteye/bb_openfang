@@ -50,6 +50,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/infisical-sync/HAND.toml"),
             include_str!("../bundled/infisical-sync/SKILL.md"),
         ),
+        (
+            "opencode-coder",
+            include_str!("../bundled/opencode-coder/HAND.toml"),
+            include_str!("../bundled/opencode-coder/SKILL.md"),
+        ),
     ]
 }
 
@@ -81,7 +86,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 9);
+        assert_eq!(hands.len(), 10);
     }
 
     #[test]
@@ -453,5 +458,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parse_opencode_coder_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "opencode-coder")
+            .expect("opencode-coder hand must be in bundled_hands()");
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "opencode-coder");
+        assert_eq!(def.name, "OpenCode Coder");
+        assert_eq!(def.category, crate::HandCategory::Development);
+        assert!(def.skill_content.is_some());
+        assert!(def.requires.is_empty()); // no hard requirements — bb_opencode is always present
+        assert!(def.tools.contains(&"shell_exec".to_string()));
+        assert!(def.tools.contains(&"memory_store".to_string()));
+        assert!(def.tools.contains(&"memory_recall".to_string()));
+        assert!(def.tools.contains(&"event_publish".to_string()));
+        assert!(!def.settings.is_empty());
+        assert!(!def.dashboard.metrics.is_empty());
+        assert!(!def.agent.system_prompt.is_empty());
+        assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
     }
 }
