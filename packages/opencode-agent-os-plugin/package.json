@@ -1,0 +1,26 @@
+{
+  "name": "@openfang/opencode-agent-os-plugin",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that provides Agent OS primitives inspired by OpenFang",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "agent-os",
+    "openfang"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0"
+  }
+}
